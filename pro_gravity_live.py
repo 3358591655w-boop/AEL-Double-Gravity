@@ -1,0 +1,2024 @@
+"""Automatic AEL Pro gravity dashboard.
+
+All valuation inputs are fetched from public sources; the interface has no
+manual ERP/g data entry. Buffett's indicator is the US corporate-equity/GDP
+ratio. CAPE is Robert Shiller's official US (S&P 500) CAPE series. Because CAPE
+is not published there as a comparable Nasdaq/Dow series, the UI keeps it
+explicitly labelled as a common US-market benchmark rather than falsely
+relabeling it as index-specific.
+
+The institutional expectation archive is fetched in the background from the
+public Dahlquist-Ibert Mendeley dataset. Raw field mapping is conservative:
+only explicit ERP or same-row equity-minus-cash and clearly forward-looking
+growth fields qualify. Other fields are never silently promoted to ERP/g.
+"""
+from __future__ import annotations
+
+import csv
+import io
+import json
+import math
+import os
+import re
+import statistics
+from calendar import month_abbr, month_name
+import threading
+import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+
+try:
+    import pandas as pd
+except Exception:  # a useful status is returned if optional Excel support is missing
+    pd = None
+
+BASE = Path(__file__).resolve().parent
+CACHE_DIR = BASE / "data" / "gravity" / "auto_cache"
+SOURCE_ARCHIVE = CACHE_DIR / "dahlquist_ibert_replication.zip"
+SOURCE_MANIFEST = CACHE_DIR / "institution_source_status.json"
+SHILLER_URLS = [
+    "https://www.econ.yale.edu/~shiller/data/ie_data.xls",
+    "https://www.econ.yale.edu/~shiller/data/ie_data.xlsx",
+]
+MENDELEY_META_URL = "https://api.data.mendeley.com/datasets/xtx7tg6jpx/zip?version=2"
+MENDELEY_DATASET_URL = "https://data.mendeley.com/datasets/xtx7tg6jpx/2"
+FRED_GRAPH_URL = "https://fred.stlouisfed.org/graph/fredgraph.csv"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+INDEXES = {
+    "SP500": {"symbol": "^GSPC", "name": "标普 500"},
+    "NASDAQ": {"symbol": "^IXIC", "name": "纳斯达克综合指数"},
+    "DOW": {"symbol": "^DJI", "name": "道琼斯工业平均指数"},
+}
+# Public FRED series; equities are millions of USD and GDP is billions of USD.
+FRED_SERIES = {
+    "nonfinancial_equities": "NCBEILQ027S",
+    "financial_equities": "FBCELLQ027S",
+    "nominal_gdp": "GDP",
+    "real_yield_10y": "DFII10",
+    "nominal_yield_10y": "DGS10",
+    "money_stock_m1": "M1SL",
+    "money_velocity_m1": "M1V",
+    "price_level_gdp_deflator": "GDPDEF",
+    "real_gdp": "GDPC1",
+    "corporate_profit_after_tax": "CPATAX",
+    "nominal_tbill_3m": "TB3MS",
+}
+# AEL normalized objective ERP anchor. Kept separate from the trailing realized
+# ERP diagnostic so temporary valuation expansion/contraction cannot mechanically
+# move the long-run objective gravity baseline.
+OBJECTIVE_ERP_NORMALIZED_PCT = 4.2
+OBJECTIVE_ERP_METHOD = "AEL_NORMALIZED_ERP_4_2"
+TTL_SECONDS = int(os.getenv("AEL_GRAVITY_CACHE_TTL", "21600"))
+_HTTP = requests.Session()
+_HTTP.headers.update({"User-Agent": "Mozilla/5.0 (compatible; AELResearch/2.6.58; +https://github.com/)"})
+_LOCK = threading.RLock()
+_BUYER_LOCK = threading.Lock()
+_CACHE: dict[str, dict[str, Any]] = {}
+_BUYER_WORKER: threading.Thread | None = None
+_BUYER_LAST_ATTEMPT_AT = 0.0
+_BUYER_STATUS: dict[str, Any] = {"status": "NOT_STARTED", "message": "机构预期数据源尚未自动读取。"}
+
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _finite(value: Any) -> float | None:
+    try:
+        if value is None or str(value).strip() in {"", ".", "NA", "N/A", "nan", "NaN"}:
+            return None
+        result = float(value)
+        return result if math.isfinite(result) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _percentile(value: float | None, values: list[float]) -> float | None:
+    if value is None or not values:
+        return None
+    return round(100.0 * sum(1 for x in values if x <= value) / len(values), 2)
+
+
+def _series_csv(series_id: str, force: bool = False) -> list[dict[str, Any]]:
+    key = f"fred:{series_id}"
+    with _LOCK:
+        cached = _CACHE.get(key)
+        if cached and not force and time.time() - cached["ts"] < TTL_SECONDS:
+            return cached["value"]
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    disk = CACHE_DIR / f"fred_{series_id}.json"
+    old: list[dict[str, Any]] = []
+    if disk.exists():
+        try:
+            payload = json.loads(disk.read_text(encoding="utf-8"))
+            old = payload.get("rows", [])
+            if not force and time.time() - float(payload.get("cached_at_epoch", 0)) < TTL_SECONDS:
+                with _LOCK:
+                    _CACHE[key] = {"ts": float(payload.get("cached_at_epoch", time.time())), "value": old}
+                return old
+        except Exception:
+            old = []
+    try:
+        response = _HTTP.get(FRED_GRAPH_URL, params={"id": series_id}, timeout=(5, 14))
+        response.raise_for_status()
+        text = response.content.decode("utf-8-sig", errors="replace")
+        reader = csv.DictReader(io.StringIO(text))
+        rows = []
+        for raw in reader:
+            dt = str(raw.get("observation_date") or raw.get("DATE") or raw.get("date") or "")[:10]
+            value_col = next((k for k in raw if k and k.lower() not in {"observation_date", "date"}), None)
+            val = _finite(raw.get(value_col)) if value_col else None
+            try:
+                date.fromisoformat(dt)
+            except ValueError:
+                continue
+            if val is not None:
+                rows.append({"date": dt, "value": val})
+        if not rows:
+            raise ValueError(f"FRED {series_id} 返回空序列")
+        payload = {"series_id": series_id, "source": f"FRED {series_id}", "cached_at": _now_utc(), "cached_at_epoch": time.time(), "rows": rows}
+        disk.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        with _LOCK:
+            _CACHE[key] = {"ts": time.time(), "value": rows}
+        return rows
+    except Exception as exc:
+        if old:
+            with _LOCK:
+                _CACHE[key] = {"ts": time.time(), "value": old}
+            return old
+        raise RuntimeError(f"FRED {series_id} 获取失败：{str(exc)[:180]}") from exc
+
+
+def _parse_shiller_date(value: Any) -> date | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date().replace(day=1)
+    if isinstance(value, date):
+        return value.replace(day=1)
+    num = _finite(value)
+    if num is not None and 1800 <= num < 2200:
+        # Shiller's historic workbook usually encodes month as 1871.01, 1871.02, ...
+        yr = int(num)
+        frac = num - yr
+        # Shiller workbook commonly uses YYYY.MM; tolerate year-fraction encoding too.
+        month_candidates = [int(round(frac * 100)), int(round(frac * 12)) + 1]
+        for month in month_candidates:
+            if 1 <= month <= 12:
+                try:
+                    return date(yr, month, 1)
+                except ValueError:
+                    pass
+    text = str(value).strip()
+    m = re.match(r"^(\d{4})[./-](\d{1,2})", text)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), 1)
+        except ValueError:
+            return None
+    m = re.match(r"^(\d{1,2})[/-](\d{1,2})[/-](\d{4})", text)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(1)), 1)
+        except ValueError:
+            return None
+    # Multpl commonly uses formats such as "Oct 2026", "October 1, 2026",
+    # or "Oct 1, 2026". The old parser silently rejected all of these.
+    for fmt in ("%b %Y", "%B %Y", "%b %d, %Y", "%B %d, %Y", "%b %d %Y", "%B %d %Y"):
+        try:
+            return datetime.strptime(text, fmt).date().replace(day=1)
+        except ValueError:
+            pass
+    return None
+
+
+def _normal_header(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
+
+
+def _read_shiller_bytes(blob: bytes) -> list[dict[str, Any]]:
+    if pd is None:
+        raise RuntimeError("缺少 pandas，无法读取 Shiller Excel 数据")
+    # Shiller's URL may redirect or change file format. Detect the actual payload,
+    # instead of forcing xlrd for both .xls and .xlsx downloads.
+    engine = "openpyxl" if blob[:2] == b"PK" else "xlrd"
+    workbook = pd.ExcelFile(io.BytesIO(blob), engine=engine)
+    output: dict[str, dict[str, Any]] = {}
+    for sheet in workbook.sheet_names:
+        frame = pd.read_excel(io.BytesIO(blob), sheet_name=sheet, header=None, engine=engine)
+        frame = frame.replace({"": None})
+        if frame.empty:
+            continue
+        header_row = None
+        headers: list[str] = []
+        for idx in range(min(35, len(frame))):
+            vals = [str(x).strip() if x is not None and not (isinstance(x, float) and math.isnan(x)) else "" for x in frame.iloc[idx].tolist()]
+            norm = [_normal_header(x) for x in vals]
+            date_idx = next((i for i, h in enumerate(norm) if h in {"date", "month", "observationdate"}), None)
+            cape_idx = next((i for i, h in enumerate(norm) if h in {"cape", "shillerpe", "cyclicallyadjustedpe", "cyclicallyadjustedpriceearnings"}), None)
+            if date_idx is not None and cape_idx is not None:
+                header_row, headers = idx, vals
+                break
+        if header_row is None:
+            continue
+        normalized = [_normal_header(x) for x in headers]
+        date_idx = next(i for i, h in enumerate(normalized) if h in {"date", "month", "observationdate"})
+        cape_idx = next(i for i, h in enumerate(normalized) if h in {"cape", "shillerpe", "cyclicallyadjustedpe", "cyclicallyadjustedpriceearnings"})
+        earnings_idx = next((i for i, h in enumerate(normalized) if h in {"realearnings", "realearningspershare", "earningsreal"}), None)
+        price_idx = next((i for i, h in enumerate(normalized) if h in {"p", "price", "sp500price", "spprice"}), None)
+        dividend_idx = next((i for i, h in enumerate(normalized) if h in {"d", "dividend", "sp500dividend", "spdividend"}), None)
+        nominal_earnings_idx = next((i for i, h in enumerate(normalized) if h in {"e", "earnings", "nominalearnings"}), None)
+        cpi_idx = next((i for i, h in enumerate(normalized) if h in {"cpi", "consumerpriceindex"}), None)
+        # Shiller's official workbook normally includes P, D, E and CPI alongside CAPE.
+        for _, series in frame.iloc[header_row + 1:].iterrows():
+            vals = series.tolist()
+            if date_idx >= len(vals) or cape_idx >= len(vals):
+                continue
+            dt = _parse_shiller_date(vals[date_idx])
+            cape = _finite(vals[cape_idx])
+            real_earnings = _finite(vals[earnings_idx]) if earnings_idx is not None and earnings_idx < len(vals) else None
+            price = _finite(vals[price_idx]) if price_idx is not None and price_idx < len(vals) else None
+            dividend = _finite(vals[dividend_idx]) if dividend_idx is not None and dividend_idx < len(vals) else None
+            nominal_earnings = _finite(vals[nominal_earnings_idx]) if nominal_earnings_idx is not None and nominal_earnings_idx < len(vals) else None
+            cpi = _finite(vals[cpi_idx]) if cpi_idx is not None and cpi_idx < len(vals) else None
+            if dt is None or cape is None or cape <= 0:
+                continue
+            key = dt.isoformat()
+            output[key] = {"date": key, "cape": cape, "real_earnings": real_earnings,
+                           "price": price, "dividend": dividend, "nominal_earnings": nominal_earnings, "cpi": cpi,
+                           "source": "Robert Shiller official ie_data.xls", "source_url": SHILLER_URLS[0]}
+    rows = [output[k] for k in sorted(output)]
+    if len(rows) < 120:
+        raise ValueError("Shiller 文件中未找到可识别的 Date/CAPE 月度历史列")
+    # Some workbook formats carry earnings on a separate row/column. Do not infer it if absent.
+    for i, row in enumerate(rows):
+        row["real_earnings_growth_10y_pct"] = None
+        if row.get("real_earnings") is None or row["real_earnings"] <= 0:
+            continue
+        target = date(row["_year"], row["_month"], 1) if "_year" in row else date.fromisoformat(row["date"])
+        candidates = []
+        for prior in rows:
+            if prior["date"] >= row["date"] or prior.get("real_earnings") is None or prior["real_earnings"] <= 0:
+                continue
+            pdate = date.fromisoformat(prior["date"])
+            months = (target.year - pdate.year) * 12 + target.month - pdate.month
+            if 118 <= months <= 122:
+                candidates.append((abs(months - 120), prior))
+        if candidates:
+            prior = min(candidates, key=lambda x: x[0])[1]
+            years = (target - date.fromisoformat(prior["date"])).days / 365.2425
+            if years >= 9.5:
+                row["real_earnings_growth_10y_pct"] = (row["real_earnings"] / prior["real_earnings"]) ** (1.0 / years) * 100.0 - 100.0
+    return rows
+
+
+def _cape_history(force: bool = False) -> list[dict[str, Any]]:
+    """Load Shiller monthly history, prioritizing fields required by objective R.
+
+    The old flow accepted a CAPE-only community JSON mirror first. That mirror does
+    not carry monthly price/dividend/nominal EPS, so R_objective silently ended up
+    with zero points although CAPE itself looked healthy. Only a full official
+    P/D/E series is preferred; CAPE-only sources remain an explicit fallback.
+    """
+    key = "shiller:cape"
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    disk = CACHE_DIR / "shiller_cape.json"
+    old: list[dict[str, Any]] = []
+
+    def has_objective_inputs(rows: list[dict[str, Any]]) -> bool:
+        full = [r for r in rows if _finite(r.get("price")) is not None
+                and _finite(r.get("nominal_earnings")) is not None
+                and float(r.get("nominal_earnings") or 0) > 0]
+        return len(full) >= 121
+
+    cached_rows: list[dict[str, Any]] = []
+    with _LOCK:
+        cached = _CACHE.get(key)
+        if cached:
+            cached_rows = cached.get("value") or []
+            if not force and time.time() - cached.get("ts", 0) < TTL_SECONDS and has_objective_inputs(cached_rows):
+                return cached_rows
+    if disk.exists():
+        try:
+            payload = json.loads(disk.read_text(encoding="utf-8"))
+            disk_rows = payload.get("rows", [])
+            if isinstance(disk_rows, list):
+                old = disk_rows
+            cached_at = float(payload.get("cached_at_epoch", 0))
+            if not cached_rows:
+                cached_rows = old
+            # A fresh CAPE-only cache may supply valuation UI, but it cannot short-circuit
+            # official-source retrieval because objective R requires P and nominal E.
+            if not force and time.time() - cached_at < TTL_SECONDS and has_objective_inputs(old):
+                with _LOCK:
+                    _CACHE[key] = {"ts": cached_at, "value": old}
+                return old
+        except Exception:
+            old = cached_rows or []
+
+    errors = []
+    # First obtain the official Shiller workbook: it is the only configured source
+    # that contains the required monthly P, D and nominal E columns together.
+    for url in SHILLER_URLS:
+        try:
+            response = _HTTP.get(url, timeout=(8, 24))
+            response.raise_for_status()
+            rows = _read_shiller_bytes(response.content)
+            if not has_objective_inputs(rows):
+                raise ValueError("官方工作簿未同时解析出至少 121 个 P 与名义 E 月度观测")
+            payload = {"source_url": url, "cached_at": _now_utc(), "cached_at_epoch": time.time(), "rows": rows}
+            disk.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            with _LOCK:
+                _CACHE[key] = {"ts": time.time(), "value": rows}
+            return rows
+        except Exception as exc:
+            errors.append(f"Shiller official {url}: {str(exc)[:140]}")
+
+    # CAPE-only community mirror remains a fallback for CAPE display only; this code
+    # intentionally does not invent P/dividends/E from CAPE or real earnings.
+    mirror_url = "https://adambnash-afk.github.io/shiller-data/data/stock_market_data.json"
+    try:
+        response = _HTTP.get(mirror_url, timeout=(6, 16))
+        response.raise_for_status()
+        payload = response.json()
+        data = payload.get("data", []) if isinstance(payload, dict) else []
+        mirror_rows = []
+        for item in data:
+            try:
+                year = int(item.get("year")); month = int(item.get("month")); dt = date(year, month, 1)
+            except (TypeError, ValueError):
+                raw_date = _finite(item.get("date"))
+                if raw_date is None:
+                    continue
+                year = int(raw_date); month = int(round((raw_date - year) * 100))
+                try: dt = date(year, month, 1)
+                except ValueError: continue
+            cape = _finite(item.get("cape"))
+            if cape is None or cape <= 0: continue
+            mirror_rows.append({"date": dt.isoformat(), "cape": cape,
+                "real_earnings": _finite(item.get("real_earnings")),
+                "real_earnings_growth_10y_pct": None,
+                "price": None, "dividend": None, "nominal_earnings": None,
+                "source": "Robert Shiller public data via community JSON mirror (CAPE-only fallback; unusable for objective R)",
+                "source_url": mirror_url})
+        mirror_rows.sort(key=lambda r: r["date"])
+        if len(mirror_rows) >= 120:
+            disk.write_text(json.dumps({"source_url": mirror_url, "cached_at": _now_utc(), "cached_at_epoch": time.time(), "rows": mirror_rows}, ensure_ascii=False), encoding="utf-8")
+            with _LOCK: _CACHE[key] = {"ts": time.time(), "value": mirror_rows}
+            return mirror_rows
+        errors.append("Shiller JSON mirror: insufficient valid monthly rows")
+    except Exception as exc:
+        errors.append(f"Shiller JSON mirror: {str(exc)[:140]}")
+
+    # Multpl can keep the CAPE tile alive when all richer sources fail, but also cannot
+    # be used to construct R_objective.
+    try:
+        response = _HTTP.get("https://www.multpl.com/shiller-pe/table/by-month", timeout=(5, 12))
+        response.raise_for_status()
+        rows = []
+        for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", response.text, re.I | re.S):
+            cells = re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, re.I | re.S)
+            if len(cells) < 2: continue
+            clean = [re.sub(r"<[^>]+>", "", x).replace("&nbsp;", " ").strip() for x in cells]
+            dt = _parse_shiller_date(clean[0]); val = _finite(re.sub(r"[$,\s]", "", clean[1]))
+            if dt and val and val > 0:
+                rows.append({"date": dt.isoformat(), "cape": val, "real_earnings": None,
+                    "real_earnings_growth_10y_pct": None, "price": None, "dividend": None,
+                    "nominal_earnings": None, "source": "Multpl CAPE history fallback (not usable for objective R)",
+                    "source_url": "https://www.multpl.com/shiller-pe/table/by-month"})
+        if len(rows) >= 120:
+            rows.sort(key=lambda r: r["date"])
+            disk.write_text(json.dumps({"source_url": rows[-1]["source_url"], "cached_at": _now_utc(), "cached_at_epoch": time.time(), "rows": rows}, ensure_ascii=False), encoding="utf-8")
+            with _LOCK: _CACHE[key] = {"ts": time.time(), "value": rows}
+            return rows
+    except Exception as exc:
+        errors.append(f"Multpl fallback: {str(exc)[:140]}")
+
+    if old and len(old) >= 120:
+        with _LOCK: _CACHE[key] = {"ts": time.time(), "value": old}
+        return old
+    raise RuntimeError("Shiller CAPE 历史源不可用；" + "；".join(errors))
+
+
+def _yahoo_history(symbol: str, start: date = date(1950, 1, 1), force: bool = False) -> list[dict[str, Any]]:
+    key = f"yahoo:{symbol}:{start.isoformat()}"
+    with _LOCK:
+        cached = _CACHE.get(key)
+        if cached and not force and time.time() - cached["ts"] < TTL_SECONDS:
+            return cached["value"]
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    safe_symbol = re.sub(r"[^A-Za-z0-9^.=\-]", "", symbol)
+    disk = CACHE_DIR / f"yahoo_{safe_symbol.replace('^','idx_')}_{start.year}.json"
+    old = []
+    if disk.exists():
+        try:
+            payload = json.loads(disk.read_text(encoding="utf-8"))
+            old = payload.get("rows", [])
+            if not force and time.time() - float(payload.get("cached_at_epoch", 0)) < TTL_SECONDS:
+                with _LOCK:
+                    _CACHE[key] = {"ts": float(payload.get("cached_at_epoch", time.time())), "value": old}
+                return old
+        except Exception:
+            old = []
+    try:
+        p1 = int(datetime(start.year, 1, 1, tzinfo=timezone.utc).timestamp())
+        now = datetime.now(timezone.utc)
+        p2 = int(datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp()) + 86400
+        response = _HTTP.get(YAHOO_CHART_URL.format(symbol=requests.utils.quote(symbol, safe="")),
+                             params={"period1": p1, "period2": p2, "interval": "1d", "events": "history", "includeAdjustedClose": "true"}, timeout=(6, 16))
+        response.raise_for_status()
+        result = ((response.json().get("chart") or {}).get("result") or [None])[0]
+        if not result:
+            raise ValueError("Yahoo Finance 未返回历史指数数据")
+        timestamps = result.get("timestamp") or []
+        indicators = result.get("indicators") or {}
+        quote = (indicators.get("quote") or [{}])[0] or {}
+        close = quote.get("close") or []
+        adj = (indicators.get("adjclose") or [{}])[0].get("adjclose") or []
+        rows = []
+        for i, ts in enumerate(timestamps):
+            if i >= len(close):
+                continue
+            raw = adj[i] if i < len(adj) and adj[i] is not None else close[i]
+            v = _finite(raw)
+            if v is None or v <= 0:
+                continue
+            day = datetime.fromtimestamp(int(ts), tz=timezone.utc).date().isoformat()
+            rows.append({"date": day, "value": v, "kind": "adjclose" if i < len(adj) and adj[i] is not None else "close"})
+        if not rows:
+            raise ValueError("Yahoo Finance 指数历史为空")
+        payload = {"cached_at_epoch": time.time(), "cached_at": _now_utc(), "symbol": symbol, "rows": rows}
+        disk.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        with _LOCK:
+            _CACHE[key] = {"ts": time.time(), "value": rows}
+        return rows
+    except Exception as exc:
+        if old:
+            with _LOCK:
+                _CACHE[key] = {"ts": time.time(), "value": old}
+            return old
+        raise RuntimeError(f"Yahoo {symbol} 历史行情获取失败：{str(exc)[:160]}") from exc
+
+
+def _build_buffett_history(nf: list[dict[str, Any]], financial: list[dict[str, Any]], gdp: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    nmap = {r["date"]: r["value"] for r in nf}
+    fmap = {r["date"]: r["value"] for r in financial}
+    gmap = {r["date"]: r["value"] for r in gdp}
+    common = sorted(set(nmap) & set(fmap) & set(gmap))
+    rows = []
+    for dt in common:
+        # Equity liabilities are millions of USD; nominal GDP is billions USD, annualized.
+        cap_m = nmap[dt] + fmap[dt]
+        gd_b = gmap[dt]
+        if cap_m <= 0 or gd_b <= 0:
+            continue
+        ratio = cap_m / (gd_b * 1000.0) * 100.0
+        if math.isfinite(ratio):
+            rows.append({"date": dt, "value": ratio, "market_cap_millions": cap_m,
+                         "gdp_billions_annualized": gd_b, "source": "Federal Reserve Z.1/FRED", 
+                         "available_date_proxy": (date.fromisoformat(dt) + timedelta(days=75)).isoformat()})
+    return rows
+
+
+def _load_world_bank_buffett(force: bool = False) -> dict[str, Any]:
+    """Annual listed-domestic-market-cap/GDP series; a transparent Buffett-type measure.
+
+    World Bank indicator CM.MKT.LCAP.GD.ZS is already expressed as percent of GDP.
+    It is annual and not marked-to-market daily, which is preferable to presenting
+    a broad Z.1 corporate-equity-liability proxy as a precise current Buffett ratio.
+    """
+    key = "worldbank:listed_market_cap_gdp"
+    with _LOCK:
+        cached = _CACHE.get(key)
+        if cached and not force and time.time() - cached["ts"] < TTL_SECONDS:
+            return cached["value"]
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    disk = CACHE_DIR / "worldbank_buffett.json"
+    if disk.exists() and not force:
+        try:
+            payload = json.loads(disk.read_text(encoding="utf-8"))
+            if time.time() - float(payload.get("cached_at_epoch", 0)) < TTL_SECONDS and payload.get("history"):
+                result = payload
+                with _LOCK:
+                    _CACHE[key] = {"ts": float(payload["cached_at_epoch"]), "value": result}
+                return result
+        except Exception:
+            pass
+    url = "https://api.worldbank.org/v2/country/USA/indicator/CM.MKT.LCAP.GD.ZS?format=json&per_page=100"
+    response = _HTTP.get(url, timeout=(5, 18), headers={"Accept": "application/json"})
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, list) or len(payload) < 2 or not isinstance(payload[1], list):
+        raise ValueError("世界银行上市公司市值/GDP接口返回结构异常")
+    history = []
+    for row in payload[1]:
+        year = str(row.get("date", ""))
+        value = _finite(row.get("value"))
+        if not re.fullmatch(r"\d{4}", year) or value is None or value <= 0:
+            continue
+        # Do not invent the exact publication date. The value's observation date is
+        # year-end, and the UI labels it as annual World Bank data.
+        history.append({"date": f"{year}-12-31", "year": int(year), "value": value,
+                        "available_date_proxy": f"{int(year)+2}-01-01",
+                        "source": "World Bank CM.MKT.LCAP.GD.ZS",
+                        "source_url": "https://data.worldbank.org/indicator/CM.MKT.LCAP.GD.ZS?locations=US"})
+    history.sort(key=lambda r: r["date"])
+    if len(history) < 10:
+        raise ValueError("世界银行上市公司市值/GDP有效历史不足10年")
+    latest = history[-1]
+    result = {"current": {**latest, "method": "世界银行美国上市国内公司市值/GDP年度指标；不是每日估算"},
+              "history": history, "source": "World Bank CM.MKT.LCAP.GD.ZS",
+              "definition_warning": "年度上市国内公司市值/GDP指标；公布滞后，不是实时日频指标。",
+              "frequency": "annual", "errors": []}
+    saved = {**result, "cached_at": _now_utc(), "cached_at_epoch": time.time()}
+    disk.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+    with _LOCK:
+        _CACHE[key] = {"ts": time.time(), "value": result}
+    return result
+
+
+def _load_buffett(force: bool = False) -> dict[str, Any]:
+    key = "buffett:series"
+    with _LOCK:
+        cached = _CACHE.get(key)
+        if cached and not force and time.time() - cached["ts"] < TTL_SECONDS:
+            return cached["value"]
+    errors = []
+    try:
+        return _load_world_bank_buffett(force)
+    except Exception as exc:
+        errors.append(f"World Bank listed market cap/GDP: {str(exc)[:150]}")
+    tasks = {
+        "nf": lambda: _series_csv(FRED_SERIES["nonfinancial_equities"], force),
+        "financial": lambda: _series_csv(FRED_SERIES["financial_equities"], force),
+        "gdp": lambda: _series_csv(FRED_SERIES["nominal_gdp"], force),
+        "sp500": lambda: _yahoo_history("^GSPC", date(1945, 1, 1), force),
+    }
+    outputs = {}
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_map = {executor.submit(fn): name for name, fn in tasks.items()}
+        for future in as_completed(future_map, timeout=24):
+            name = future_map[future]
+            try:
+                outputs[name] = future.result()
+            except Exception as exc:
+                errors.append(f"{name}: {str(exc)[:120]}")
+    if not all(k in outputs for k in ("nf", "financial", "gdp", "sp500")):
+        raise RuntimeError("巴菲特指标源数据获取失败：" + "；".join(errors))
+    history = _build_buffett_history(outputs["nf"], outputs["financial"], outputs["gdp"])
+    if len(history) < 25:
+        raise RuntimeError("联储市值/GDP共同历史样本不足")
+    sp_rows = outputs["sp500"]
+    by_date = {r["date"]: r["value"] for r in sp_rows}
+    last = history[-1]
+    anchor = date.fromisoformat(last["date"])
+    anchor_px_rows = [r for r in sp_rows if r["date"] <= last["date"]]
+    current_px = sp_rows[-1]
+    if not anchor_px_rows:
+        raise RuntimeError("无法将标普指数与联储市值数据锚定")
+    anchor_px = anchor_px_rows[-1]["value"]
+    current_cap = last["market_cap_millions"] * current_px["value"] / anchor_px
+    # GDP latest value stays quarterly; only the market-cap estimate is marked to latest S&P close.
+    current_value = current_cap / (last["gdp_billions_annualized"] * 1000.0) * 100.0
+    current = {"date": current_px["date"], "value": current_value, "anchor_date": last["date"],
+               "anchor_price": anchor_px, "current_sp500_close": current_px["value"],
+               "market_cap_millions_estimate": current_cap,
+               "gdp_billions_annualized": last["gdp_billions_annualized"],
+               "source": "Federal Reserve Z.1/FRED equities; S&P 500 close-scaled daily estimate",
+               "method": "最新联储企业股权市值按标普 500 从最近季度锚点滚动更新，再除以最新名义 GDP；不是任一单独指数的市值/GDP。"}
+    if current_value > 350 or current_value <= 0:
+        # Broad Z.1 liabilities are not comparable to listed-market capitalization.
+        # Do not surface a wildly out-of-range value as the Buffett indicator.
+        current = None
+        errors.append(f"Z.1 fallback rejected as current Buffett value: {current_value:.2f}% outside validation bounds")
+    result = {"current": current, "history": history, "source": "FRED Z.1 corporate-equity liabilities/GDP proxy (fallback only)", "definition_warning": "Z.1 corporate-equity liabilities cover a broader universe than listed domestic market capitalization; fallback is not a canonical Buffett indicator.", "errors": errors, "frequency": "quarterly_proxy"}
+    with _LOCK:
+        _CACHE[key] = {"ts": time.time(), "value": result}
+    return result
+
+
+def _load_yield(series_key: str, force: bool = False) -> dict[str, Any]:
+    series_id = FRED_SERIES[series_key]
+    rows = _series_csv(series_id, force)
+    latest = rows[-1]
+    label = "十年期实际收益率" if series_key == "real_yield_10y" else ("三个月国库券名义收益率" if series_key == "nominal_tbill_3m" else "十年期名义收益率")
+    return {"date": latest["date"], "value": latest["value"], "history": rows,
+            "source": f"FRED {series_id}", "source_url": f"https://fred.stlouisfed.org/series/{series_id}",
+            "basis": "real" if series_key == "real_yield_10y" else "nominal", "label": label}
+
+
+def _load_real_yield(force: bool = False) -> dict[str, Any]:
+    return _load_yield("real_yield_10y", force)
+
+
+def _load_nominal_yield(force: bool = False) -> dict[str, Any]:
+    return _load_yield("nominal_yield_10y", force)
+
+
+def _load_macro_observables(force: bool = False) -> dict[str, Any]:
+    mapping = {
+        "M1": "money_stock_m1", "V_M1": "money_velocity_m1",
+        "P_GDP_DEFLATOR": "price_level_gdp_deflator", "Q_REAL_GDP": "real_gdp",
+        "CORPORATE_PROFIT_AFTER_TAX": "corporate_profit_after_tax", "NOMINAL_GDP": "nominal_gdp",
+    }
+    result: dict[str, Any] = {}
+    errors = []
+    def fetch(label: str, key: str):
+        rows = _series_csv(FRED_SERIES[key], force)
+        return label, {"date": rows[-1]["date"], "value": rows[-1]["value"], "history": rows,
+                       "source": f"FRED {FRED_SERIES[key]}", "source_url": f"https://fred.stlouisfed.org/series/{FRED_SERIES[key]}"}
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {pool.submit(fetch, label, key): label for label, key in mapping.items()}
+        for future in as_completed(futures, timeout=20):
+            label = futures[future]
+            try:
+                name, value = future.result()
+                result[name] = value
+            except Exception as exc:
+                key = mapping[label]
+                errors.append(f"{label}: {str(exc)[:140]}")
+                result[label] = {"date": None, "value": None, "history": [], "error": str(exc)[:180],
+                                 "source": f"FRED {FRED_SERIES[key]}", "source_url": f"https://fred.stlouisfed.org/series/{FRED_SERIES[key]}"}
+    # Mark unfinished source calls as unavailable instead of failing the whole dashboard.
+    for label, key in mapping.items():
+        if label not in result:
+            result[label] = {"date": None, "value": None, "history": [], "error": "源请求超时",
+                             "source": f"FRED {FRED_SERIES[key]}", "source_url": f"https://fred.stlouisfed.org/series/{FRED_SERIES[key]}"}
+            errors.append(f"{label}: source timeout")
+    result["errors"] = errors
+    return result
+
+
+def _read_frame_from_archive_member(name: str, data: bytes):
+    if pd is None:
+        return None
+    lower = name.lower()
+    try:
+        if lower.endswith(".csv"):
+            return pd.read_csv(io.BytesIO(data), low_memory=False)
+        if lower.endswith(".xlsx"):
+            return pd.read_excel(io.BytesIO(data), sheet_name=0, engine="openpyxl")
+        if lower.endswith(".xls"):
+            return pd.read_excel(io.BytesIO(data), sheet_name=0, engine="xlrd")
+        if lower.endswith(".dta"):
+            return pd.read_stata(io.BytesIO(data), convert_categoricals=False)
+        if lower.endswith(".parquet"):
+            return pd.read_parquet(io.BytesIO(data))
+    except Exception:
+        return None
+    return None
+
+
+def _col_norm(name: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name).lower())
+
+
+def _choose_column(columns: list[str], candidates: list[str], contains: list[str] | None = None,
+                   excludes: list[str] | None = None) -> str | None:
+    norm_map = {_col_norm(c): c for c in columns}
+    for cand in candidates:
+        if _col_norm(cand) in norm_map:
+            return norm_map[_col_norm(cand)]
+    contains = [_col_norm(x) for x in (contains or [])]
+    excludes = [_col_norm(x) for x in (excludes or [])]
+    for col in columns:
+        normalized = _col_norm(col)
+        if contains and all(piece in normalized for piece in contains) and not any(piece in normalized for piece in excludes):
+            return col
+    return None
+
+
+def _frame_buyer_observations(frame, source_file: str) -> list[dict[str, Any]]:
+    if pd is None or frame is None or frame.empty:
+        return []
+    cols = [str(c) for c in frame.columns]
+    # Do not accept raw data without an observation date, provider, and a horizon column.
+    date_col = _choose_column(cols, ["Date", "ObservationDate", "as_of_date", "CMA_Date", "SurveyDate", "YearMonth"])
+    provider_col = _choose_column(cols, ["Provider", "Institution", "InstitutionName", "Manager", "Firm", "Respondent"])
+    horizon_col = _choose_column(cols, ["Horizon_adj", "Horizon", "HorizonYears", "ForecastHorizon", "Maturity"])
+    if not date_col or not provider_col or not horizon_col:
+        return []
+    equity_real_col = _choose_column(cols, ["US_Equity_r", "ExpectedRealEquityReturn", "RealEquityReturn", "EquityReturnReal"])
+    equity_col = _choose_column(cols, ["US_Equity", "ExpectedEquityReturn", "EquityReturn", "NominalEquityReturn"])
+    cash_real_col = _choose_column(cols, ["US_Cash_r", "ExpectedRealCashReturn", "RealCashReturn", "CashReturnReal"])
+    cash_col = _choose_column(cols, ["US_Cash", "ExpectedCashReturn", "CashReturn", "NominalCashReturn", "US_Treasury"])
+    explicit_erp_col = _choose_column(cols, ["buyer_erp_pct", "ERP", "EquityRiskPremium", "ExpectedEquityPremium", "US_ERP", "RiskPremium"],
+                                      contains=["premium"], excludes=["term", "credit", "bond"])
+    growth_col = _choose_column(cols,
+        ["buyer_g_pct", "gB_expected_pct", "ExpectedEarningsGrowth", "LongRunEarningsGrowth", "ExpectedRealEarningsGrowth", "AnalystLongTermGrowth", "GrowthForecast"],
+        contains=["growth"], excludes=["observed", "realized", "actual", "historical", "past", "lagged"])
+    # A source's expected real equity return can form an ERP using the same-row expected cash return.
+    if not date_col or not provider_col or not (explicit_erp_col or ((equity_real_col or equity_col) and (cash_real_col or cash_col))):
+        return []
+    result = []
+    for _, row in frame.iterrows():
+        raw_date = row.get(date_col)
+        try:
+            if hasattr(raw_date, "to_pydatetime"):
+                obs_date = raw_date.to_pydatetime().date()
+            elif isinstance(raw_date, (datetime, date)):
+                obs_date = raw_date.date() if isinstance(raw_date, datetime) else raw_date
+            else:
+                text = str(raw_date).strip()
+                try:
+                    obs_date = date.fromisoformat(text[:10])
+                except ValueError:
+                    numeric = _finite(text)
+                    if numeric and 1800 <= numeric < 2200:
+                        yr = int(numeric); mo = int(round((numeric-yr)*100)); obs_date = date(yr, max(1,min(12,mo)), 1)
+                    else:
+                        continue
+        except Exception:
+            continue
+        provider = str(row.get(provider_col, "")).strip()
+        if not provider or provider.lower() in {"nan", "none", ""}:
+            continue
+        horizon = _finite(row.get(horizon_col)) if horizon_col else None
+        if horizon is None or not (5 <= horizon <= 15):
+            continue
+        erp = _finite(row.get(explicit_erp_col)) if explicit_erp_col else None
+        erp_method = f"explicit:{explicit_erp_col}" if explicit_erp_col else None
+        erp_basis = "real" if explicit_erp_col and any(x in _col_norm(explicit_erp_col) for x in ("real", "inflationadjusted")) else ("nominal" if explicit_erp_col and any(x in _col_norm(explicit_erp_col) for x in ("nominal",)) else "unknown")
+        # Never subtract a nominal return from a real return: same-basis pairs only.
+        equity_real_val = _finite(row.get(equity_real_col)) if equity_real_col else None
+        cash_real_val = _finite(row.get(cash_real_col)) if cash_real_col else None
+        equity_nominal_val = _finite(row.get(equity_col)) if equity_col else None
+        cash_nominal_val = _finite(row.get(cash_col)) if cash_col else None
+        equity_val = equity_real_val if equity_real_val is not None else equity_nominal_val
+        cash_val = cash_real_val if cash_real_val is not None else cash_nominal_val
+        if erp is None and equity_real_val is not None and cash_real_val is not None:
+            erp = equity_real_val - cash_real_val
+            erp_basis = "real"
+            erp_method = f"same_row_real_difference:{equity_real_col}-{cash_real_col}"
+        elif erp is None and equity_nominal_val is not None and cash_nominal_val is not None:
+            erp = equity_nominal_val - cash_nominal_val
+            erp_basis = "nominal"
+            erp_method = f"same_row_nominal_difference:{equity_col}-{cash_col}"
+        growth = _finite(row.get(growth_col)) if growth_col else None
+        growth_name = _col_norm(growth_col or "")
+        growth_basis = "real" if "real" in growth_name else ("nominal" if "nominal" in growth_name else "unknown")
+        if erp is None:
+            continue
+        result.append({"date": obs_date.isoformat(), "institution": provider,
+                       "horizon_years": horizon, "buyer_erp_pct": erp, "buyer_g_pct": growth,
+                       "erp_basis": erp_basis, "growth_basis": growth_basis,
+                       "source_file": source_file, "source_date_column": date_col,
+                       "source_erp_method": erp_method, "source_erp_column": explicit_erp_col,
+                       "source_growth_column": growth_col, "expected_equity_return_pct": equity_val,
+                       "expected_cash_return_pct": cash_val})
+    return result
+
+
+def _extract_institution_records(path: Path) -> dict[str, Any]:
+    usable: list[dict[str, Any]] = []
+    inspected_files = []
+    skipped_files = []
+    with zipfile.ZipFile(path) as archive:
+        bad = archive.testzip()
+        if bad:
+            raise RuntimeError(f"机构研究 ZIP CRC 校验失败：{bad}")
+        total_uncompressed = sum(i.file_size for i in archive.infolist() if not i.is_dir())
+        if total_uncompressed > 600 * 1024 * 1024:
+            raise RuntimeError("机构数据包解压体积超过安全上限")
+        for item in archive.infolist():
+            if item.is_dir():
+                continue
+            ext = Path(item.filename).suffix.lower()
+            if ext not in {".csv", ".xlsx", ".xls", ".dta", ".parquet"}:
+                continue
+            if item.file_size > 250 * 1024 * 1024:
+                skipped_files.append({"file": item.filename, "reason": "file_size_limit"})
+                continue
+            try:
+                frame = _read_frame_from_archive_member(item.filename, archive.read(item))
+                records = _frame_buyer_observations(frame, item.filename)
+                inspected_files.append({"file": item.filename, "rows": int(len(frame)) if frame is not None else 0,
+                                        "columns": [str(c) for c in frame.columns] if frame is not None else [],
+                                        "usable_buyer_rows": len(records)})
+                usable.extend(records)
+            except Exception as exc:
+                skipped_files.append({"file": item.filename, "reason": str(exc)[:160]})
+    # ERP and g must come from the same date, same institution row, same horizon and same basis.
+    joint = [r for r in usable if r.get("buyer_g_pct") is not None and r.get("erp_basis") in {"real", "nominal"}
+             and r.get("growth_basis") == r.get("erp_basis")]
+    if joint:
+        max_date = max(r["date"] for r in joint)
+        same_date = [r for r in joint if r["date"] == max_date]
+        # Select the most represented horizon closest to 10 years; never pool disparate horizons.
+        horizon_counts: dict[float, int] = {}
+        for row in same_date:
+            h = round(float(row["horizon_years"]), 2)
+            horizon_counts[h] = horizon_counts.get(h, 0) + 1
+        chosen_horizon = sorted(horizon_counts, key=lambda h: (-horizon_counts[h], abs(h - 10.0), h))[0]
+        matched = [r for r in same_date if round(float(r["horizon_years"]), 2) == chosen_horizon]
+        basis = matched[0]["erp_basis"]
+        summary = {
+            "as_of_date": max_date,
+            "horizon_years": chosen_horizon,
+            "return_basis": basis,
+            "institution_count": len({r["institution"] for r in matched}),
+            "row_count": len(matched),
+            "buyer_erp_pct": statistics.median(r["buyer_erp_pct"] for r in matched),
+            "buyer_g_pct": statistics.median(r["buyer_g_pct"] for r in matched),
+            "buyer_g_count": len(matched),
+            "growth_method": "explicit forward-looking source field; same return basis and horizon",
+            "source_file_count": len(inspected_files),
+            "matched_horizons_years": [chosen_horizon],
+        }
+    else:
+        usable_erp = [r for r in usable if r.get("buyer_erp_pct") is not None]
+        max_date = max((r["date"] for r in usable_erp), default=None)
+        latest = [r for r in usable_erp if r["date"] == max_date] if max_date else []
+        summary = {"as_of_date": max_date, "horizon_years": None, "return_basis": None,
+                   "institution_count": len({r["institution"] for r in latest}), "row_count": len(latest),
+                   "buyer_erp_pct": statistics.median(r["buyer_erp_pct"] for r in latest) if latest else None,
+                   "buyer_g_pct": None, "buyer_g_count": 0, "growth_method": None,
+                   "source_file_count": len(inspected_files), "matched_horizons_years": []}
+    if summary["buyer_erp_pct"] is not None and summary["buyer_g_pct"] is not None:
+        status = "USABLE_ERP_AND_G"
+    elif summary["buyer_erp_pct"] is not None:
+        status = "ERP_G_BASIS_OR_SOURCE_MISSING"
+    else:
+        status = "SOURCE_DOWNLOADED_BUT_FIELDS_UNMAPPED"
+    return {"status": status, "summary": summary, "usable_row_count": len(usable), "records": usable,
+            "inspected_files": inspected_files, "skipped_files": skipped_files,
+            "message": "机构 ERP/g 已在相同日期、期限与回报口径匹配" if status == "USABLE_ERP_AND_G" else
+                       "已解析部分机构数据，但 ERP/g 的预测期限、回报口径或前瞻增长字段不完整；不会生成不合格 Theta。"}
+
+
+
+def _discover_mendeley_public_download_urls(page_html: str) -> list[str]:
+    """Extract public file download candidates from the public dataset landing page.
+
+    The new Mendeley Data API requires OIDC/OAuth (old unauthenticated calls return
+    401). This fallback only follows candidates embedded on the public dataset page;
+    the caller validates that the response is a real ZIP before accepting it.
+    """
+    from html import unescape
+    html = unescape(page_html or "")
+    urls: list[str] = []
+    pattern = r"(?:href|url|downloadUrl|download_url)\s*[=:]\s*['\"]([^'\"]+)['\"]"
+    for match in re.finditer(pattern, html, re.I):
+        raw = match.group(1).replace("\\/", "/")
+        if any(token in raw.lower() for token in ("download", ".zip", "public-files", "file_downloaded")):
+            if raw.startswith("/"):
+                raw = "https://data.mendeley.com" + raw
+            if raw.startswith("https://") and "xtx7tg6jpx" in raw:
+                urls.append(raw)
+    filename = "Dahlquist_Ibert_replication_JFE-lkATwi.zip"
+    for found in re.finditer(re.escape(filename), html, re.I):
+        context = html[max(0, found.start()-3000):min(len(html), found.end()+3000)]
+        for match in re.finditer(r"(?i)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", context):
+            fid = match.group(1)
+            urls.extend([
+                f"https://data.mendeley.com/public-files/datasets/xtx7tg6jpx/files/{fid}/file_downloaded?version=2",
+                f"https://data.mendeley.com/public-files/datasets/xtx7tg6jpx/files/{fid}?download=1",
+            ])
+    for fid in re.findall(r"(?i)([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", html)[:30]:
+        urls.append(f"https://data.mendeley.com/public-files/datasets/xtx7tg6jpx/files/{fid}/file_downloaded?version=2")
+    return list(dict.fromkeys(urls))
+
+
+def _download_mendeley_public_page_zip() -> requests.Response:
+    """Try the user-facing public download path when the API returns 401."""
+    page = _HTTP.get(MENDELEY_DATASET_URL, timeout=(8, 25), headers={"Accept": "text/html,application/xhtml+xml"})
+    page.raise_for_status()
+    candidates = _discover_mendeley_public_download_urls(page.text)
+    if not candidates:
+        raise RuntimeError("公开数据页未暴露可识别的 ZIP/文件 UUID；Mendeley API 需要 OIDC OAuth")
+    failures = []
+    for url in candidates[:40]:
+        try:
+            resp = _HTTP.get(url, timeout=(10, 120), stream=True, allow_redirects=True,
+                             headers={"Referer": MENDELEY_DATASET_URL, "Accept": "application/zip,application/octet-stream,*/*"})
+            resp.raise_for_status()
+            ctype = str(resp.headers.get("content-type", "")).lower()
+            if "text/html" in ctype or "application/json" in ctype:
+                resp.close()
+                failures.append(f"{url}: 返回 {ctype or '文本'}")
+                continue
+            return resp
+        except Exception as exc:
+            failures.append(f"{url}: {str(exc)[:90]}")
+    raise RuntimeError("公开页面候选下载均失败：" + "；".join(failures[:4]))
+
+
+def _download_institution_archive() -> dict[str, Any]:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    if SOURCE_ARCHIVE.exists() and zipfile.is_zipfile(SOURCE_ARCHIVE):
+        try:
+            source = _extract_institution_records(SOURCE_ARCHIVE)
+            SOURCE_MANIFEST.write_text(json.dumps(source, ensure_ascii=False, default=str), encoding="utf-8")
+            return source
+        except Exception:
+            pass
+    try:
+        # Public dataset ZIP metadata can report IN_PROGRESS / omit url. In that
+        # case use the documented public redirect endpoint rather than trying to
+        # download the human-facing HTML page as if it were a ZIP.
+        meta = {}
+        try:
+            meta_response = _HTTP.get(MENDELEY_META_URL, timeout=(8, 20))
+            meta_response.raise_for_status()
+            meta = meta_response.json()
+        except Exception as meta_exc:
+            meta = {"metadata_error": str(meta_exc)[:180]}
+        download_url = meta.get("url")
+        if download_url:
+            response = _HTTP.get(download_url, timeout=(10, 120), stream=True)
+            response.raise_for_status()
+        else:
+            redirect_url = "https://api.data.mendeley.com/datasets/xtx7tg6jpx/zip/file_downloaded?version=2"
+            try:
+                response = _HTTP.get(redirect_url, timeout=(10, 35), stream=True, allow_redirects=True)
+                response.raise_for_status()
+                content_type = str(response.headers.get("content-type", "")).lower()
+                if "json" in content_type or "text/html" in content_type:
+                    response.close()
+                    raise RuntimeError(f"Mendeley API 返回非 ZIP 内容：{content_type}")
+            except Exception as api_exc:
+                try:
+                    response = _download_mendeley_public_page_zip()
+                except Exception as page_exc:
+                    raise RuntimeError(
+                        f"机构研究原始数据下载失败：Mendeley Data API 要求 OIDC/OAuth，接口响应 {str(api_exc)[:120]}；"
+                        f"公开页面备用下载也失败：{str(page_exc)[:220]}。未伪造机构记录。"
+                    ) from page_exc
+        temp = SOURCE_ARCHIVE.with_suffix(".part")
+        total = 0
+        with temp.open("wb") as stream:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > 120 * 1024 * 1024:
+                    raise RuntimeError("下载大小超过预期上限 120 MB")
+                stream.write(chunk)
+        if not zipfile.is_zipfile(temp):
+            temp.unlink(missing_ok=True)
+            raise RuntimeError("官方下载内容不是 ZIP")
+        with zipfile.ZipFile(temp) as archive:
+            bad = archive.testzip()
+            total_uncompressed = sum(i.file_size for i in archive.infolist() if not i.is_dir())
+            if bad or total_uncompressed > 600 * 1024 * 1024:
+                temp.unlink(missing_ok=True)
+                raise RuntimeError("原始机构 ZIP 校验失败或解压体积超限")
+            root = CACHE_DIR.resolve()
+            for member in archive.infolist():
+                if not (root / member.filename).resolve().is_relative_to(root):
+                    temp.unlink(missing_ok=True)
+                    raise RuntimeError("ZIP 中存在越界路径，已拒绝")
+        temp.replace(SOURCE_ARCHIVE)
+        source = _extract_institution_records(SOURCE_ARCHIVE)
+        source["download"] = {"size_bytes": total, "sha256": _sha256(SOURCE_ARCHIVE), "source_url": MENDELEY_DATASET_URL}
+        SOURCE_MANIFEST.write_text(json.dumps(source, ensure_ascii=False, default=str), encoding="utf-8")
+        return source
+    except Exception as exc:
+        # If no remote download is possible, provide an explicit status rather than fabricating ERP/g.
+        return {"status": "DOWNLOAD_FAILED", "summary": {"as_of_date": None, "institution_count": 0, "row_count": 0,
+                "buyer_erp_pct": None, "buyer_g_pct": None, "buyer_g_count": 0, "growth_method": None},
+                "usable_row_count": 0, "records": [], "inspected_files": [], "skipped_files": [],
+                "message": f"机构原始研究包自动下载失败：{str(exc)[:220]}", "source_url": MENDELEY_DATASET_URL}
+
+
+def _sha256(path: Path) -> str:
+    import hashlib
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _get_buyer_status(start_if_missing: bool = True, force_retry: bool = False) -> dict[str, Any]:
+    global _BUYER_WORKER, _BUYER_STATUS, _BUYER_LAST_ATTEMPT_AT
+    if SOURCE_MANIFEST.exists():
+        try:
+            manifest = json.loads(SOURCE_MANIFEST.read_text(encoding="utf-8"))
+            if manifest.get("status") in {"USABLE_ERP_AND_G", "ERP_G_BASIS_OR_SOURCE_MISSING", "SOURCE_DOWNLOADED_BUT_FIELDS_UNMAPPED"}:
+                _BUYER_STATUS = manifest
+            elif _BUYER_STATUS.get("status") == "NOT_STARTED":
+                _BUYER_STATUS = manifest
+        except Exception:
+            pass
+    retry_cooldown = max(60, int(os.getenv("AEL_BUYER_DOWNLOAD_RETRY_SECONDS", "300")))
+    retry_due = force_retry or (time.time() - _BUYER_LAST_ATTEMPT_AT >= retry_cooldown)
+    if start_if_missing and not SOURCE_ARCHIVE.exists() and _BUYER_STATUS.get("status") in {"NOT_STARTED", "DOWNLOAD_FAILED"} and retry_due:
+        with _BUYER_LOCK:
+            retry_due_locked = force_retry or (time.time() - _BUYER_LAST_ATTEMPT_AT >= retry_cooldown)
+            if retry_due_locked and (_BUYER_WORKER is None or not _BUYER_WORKER.is_alive()):
+                _BUYER_LAST_ATTEMPT_AT = time.time()
+                _BUYER_STATUS = {"status": "DOWNLOADING", "message": "正在后台获取论文官方机构预期原始数据；自动轮询只读取状态，不会反复重启下载。", "source_url": MENDELEY_DATASET_URL, "attempt_started_at": _now_utc()}
+                def worker():
+                    global _BUYER_STATUS
+                    result = _download_institution_archive()
+                    _BUYER_STATUS = result
+                _BUYER_WORKER = threading.Thread(target=worker, name="ael-gravity-institution-data", daemon=True)
+                _BUYER_WORKER.start()
+    elif SOURCE_ARCHIVE.exists() and _BUYER_STATUS.get("status") in {"NOT_STARTED", "DOWNLOAD_FAILED"} and retry_due:
+        with _BUYER_LOCK:
+            retry_due_locked = force_retry or (time.time() - _BUYER_LAST_ATTEMPT_AT >= retry_cooldown)
+            if retry_due_locked and (_BUYER_WORKER is None or not _BUYER_WORKER.is_alive()):
+                _BUYER_LAST_ATTEMPT_AT = time.time()
+                def worker_existing():
+                    global _BUYER_STATUS
+                    _BUYER_STATUS = _download_institution_archive()
+                _BUYER_WORKER = threading.Thread(target=worker_existing, name="ael-gravity-institution-parse", daemon=True)
+                _BUYER_WORKER.start()
+    status = dict(_BUYER_STATUS)
+    if status.get("status") == "DOWNLOAD_FAILED" and not force_retry:
+        status["retry_after_seconds"] = max(0, int(retry_cooldown - (time.time() - _BUYER_LAST_ATTEMPT_AT)))
+    return status
+
+
+def _latest_le(rows: list[dict[str, Any]], as_of: str) -> dict[str, Any] | None:
+    eligible = [r for r in rows if r.get("date", "") <= as_of]
+    return eligible[-1] if eligible else None
+
+
+def _forward_growth_from_shiller(cape_rows: list[dict[str, Any]]) -> float | None:
+    rows = [r for r in cape_rows if r.get("real_earnings") is not None and r.get("real_earnings") > 0]
+    if len(rows) < 121:
+        return None
+    current = rows[-1]
+    current_date = date.fromisoformat(current["date"])
+    target = date(current_date.year - 10, current_date.month, 1)
+    candidates = [r for r in rows if r["date"] <= target.isoformat()]
+    if not candidates:
+        return None
+    base = candidates[-1]
+    years = (current_date - date.fromisoformat(base["date"])).days / 365.2425
+    if years < 9.5:
+        return None
+    return round(((current["real_earnings"] / base["real_earnings"]) ** (1.0 / years) - 1) * 100.0, 4)
+
+
+def _institution_latest_real_return(buyer_status: dict[str, Any]) -> dict[str, Any] | None:
+    records = buyer_status.get("records") or []
+    real_return_fields = [r for r in records if r.get("expected_equity_return_pct") is not None]
+    if not real_return_fields:
+        return None
+    latest_date = max(r["date"] for r in real_return_fields)
+    rows = [r for r in real_return_fields if r["date"] == latest_date]
+    # Prefer explicitly real return field/source method when present; records preserve their raw columns.
+    values = [r["expected_equity_return_pct"] for r in rows if r.get("expected_equity_return_pct") is not None]
+    if not values:
+        return None
+    return {"date": latest_date, "expected_real_equity_return_pct": statistics.median(values),
+            "institution_count": len({r["institution"] for r in rows}),
+            "source": "Dahlquist-Ibert institutional expected equity return fields", "raw_rows": len(rows)}
+
+
+def _safe_get_data(force: bool = False) -> dict[str, Any]:
+    errors = []
+    keys = ["buffett", "cape", "real_yield", "index_sp500"]
+    with _LOCK:
+        cached = _CACHE.get("gravity:bundle")
+        if cached and not force and time.time() - cached["ts"] < TTL_SECONDS:
+            return cached["value"]
+    results = {}
+    funcs = {
+        "buffett": lambda: _load_buffett(force),
+        "cape": lambda: _cape_history(force),
+        "real_yield": lambda: _load_real_yield(force),
+        "nominal_yield": lambda: _load_nominal_yield(force),
+        "tbill_yield": lambda: _load_yield("nominal_tbill_3m", force),
+        "macro_observables": lambda: _load_macro_observables(force),
+    }
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(func): key for key, func in funcs.items()}
+        for future in as_completed(futures, timeout=30):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as exc:
+                errors.append(f"{name}: {str(exc)[:220]}")
+    results["buyer"] = _get_buyer_status(start_if_missing=True)
+    results["errors"] = errors
+    with _LOCK:
+        _CACHE["gravity:bundle"] = {"ts": time.time(), "value": results}
+    return results
+
+
+def _latest_row_on_or_before(rows: list[dict[str, Any]], as_of: str) -> dict[str, Any] | None:
+    eligible = [r for r in rows if str(r.get("date", ""))[:10] <= as_of and _finite(r.get("value")) is not None]
+    return eligible[-1] if eligible else None
+
+
+def _build_alpha_m1_v_history(macro_obs: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build a point-in-time quarterly series for alpha * M1 * V.
+
+    alpha is explicitly an operational proxy CPATAX / nominal GDP. M1SL and
+    M1V are public FRED monetary-series inputs. All monetary amounts are USD
+    billions, so the numerator is also USD billions. We only use observations
+    dated on or before the quarter being calculated.
+    """
+    profit_rows = (macro_obs.get("CORPORATE_PROFIT_AFTER_TAX") or {}).get("history") or []
+    gdp_rows = (macro_obs.get("NOMINAL_GDP") or {}).get("history") or []
+    m1_rows = (macro_obs.get("M1") or {}).get("history") or []
+    velocity_rows = (macro_obs.get("V_M1") or {}).get("history") or []
+    if not all((profit_rows, gdp_rows, m1_rows, velocity_rows)):
+        return []
+    profit_map = {str(r.get("date", ""))[:10]: _finite(r.get("value")) for r in profit_rows}
+    gdp_map = {str(r.get("date", ""))[:10]: _finite(r.get("value")) for r in gdp_rows}
+    common_dates = sorted(set(profit_map).intersection(gdp_map))
+    result: list[dict[str, Any]] = []
+    for dt in common_dates:
+        profit = profit_map.get(dt)
+        gdp = gdp_map.get(dt)
+        if profit is None or gdp is None or gdp <= 0:
+            continue
+        m1 = _latest_row_on_or_before(m1_rows, dt)
+        velocity = _latest_row_on_or_before(velocity_rows, dt)
+        if m1 is None or velocity is None:
+            continue
+        # Restrict carry-back alignment to 100 days: the source series are
+        # monthly/quarterly. This prevents an ancient observation being treated
+        # as contemporaneous after a source outage.
+        try:
+            if (date.fromisoformat(dt) - date.fromisoformat(m1["date"])).days > 100:
+                continue
+            if (date.fromisoformat(dt) - date.fromisoformat(velocity["date"])).days > 100:
+                continue
+        except Exception:
+            continue
+        alpha = profit / gdp
+        m1_value = _finite(m1.get("value"))
+        velocity_value = _finite(velocity.get("value"))
+        if m1_value is None or velocity_value is None or m1_value <= 0 or velocity_value <= 0:
+            continue
+        if not math.isfinite(alpha) or alpha < 0 or alpha > 1:
+            continue
+        numerator = alpha * m1_value * velocity_value
+        if not math.isfinite(numerator) or numerator < 0:
+            continue
+        result.append({
+            "date": dt,
+            "value": numerator,
+            "alpha_proxy": alpha,
+            "M1": m1_value,
+            "V": velocity_value,
+            "corporate_profit_after_tax": profit,
+            "nominal_gdp": gdp,
+            "M1_observation_date": m1["date"],
+            "V_observation_date": velocity["date"],
+            "source": "FRED CPATAX / GDP + M1SL + M1V; alpha is an operational proxy",
+        })
+    return result
+
+
+def _macro_model_values(macro_obs: dict[str, Any]) -> dict[str, Any]:
+    """Common-date M/V/P/Q and transparent corporate-profit-share alpha proxy.
+
+    The Fisher numerator history is computed independently from P/Q; missing
+    unrelated variables must not suppress a valid alpha*M1*V time series.
+    """
+    numerator_history = _build_alpha_m1_v_history(macro_obs)
+    latest_num = numerator_history[-1] if numerator_history else {}
+    keys = ("M1", "V_M1", "P_GDP_DEFLATOR", "Q_REAL_GDP", "CORPORATE_PROFIT_AFTER_TAX", "NOMINAL_GDP")
+    series = {k: (macro_obs.get(k) or {}).get("history") or [] for k in keys}
+    if any(not rows for rows in series.values()):
+        return {"as_of_date": latest_num.get("date"), "alpha_proxy": latest_num.get("alpha_proxy"),
+                "alpha_definition": "企业税后利润 CPATAX / 名义 GDP；透明公开数据代理，不等同于理论 α 的直接观测",
+                "M1": latest_num.get("M1"), "M1_date": latest_num.get("M1_observation_date"),
+                "V": latest_num.get("V"), "V_date": latest_num.get("V_observation_date"),
+                "P": None, "P_date": None, "Q": None, "Q_date": None,
+                "corporate_profit_after_tax": latest_num.get("corporate_profit_after_tax"),
+                "nominal_gdp": latest_num.get("nominal_gdp"),
+                "numerator_alpha_M1_V": latest_num.get("value"), "numerator_history": numerator_history,
+                "A_over_M_objective": None, "A_over_M_buyer": None,
+                "source_status": "PARTIAL_MACRO_SERIES",
+                "source_notes": "α×M1×V 历史序列独立计算；P/Q 相关字段缺失，不影响分子趋势。"}
+    # Match CPATAX and GDP on a common quarter, then use no later observation for other series.
+    common = sorted(set(r["date"] for r in series["CORPORATE_PROFIT_AFTER_TAX"]) & set(r["date"] for r in series["NOMINAL_GDP"]))
+    other_latest = min(series[k][-1]["date"] for k in ("M1", "V_M1", "P_GDP_DEFLATOR", "Q_REAL_GDP"))
+    eligible = [d for d in common if d <= other_latest]
+    if not eligible:
+        return {"as_of_date": latest_num.get("date"), "alpha_proxy": latest_num.get("alpha_proxy"),
+                "alpha_definition": "企业税后利润 CPATAX / 名义 GDP；透明公开数据代理，不等同于理论 α 的直接观测",
+                "M1": latest_num.get("M1"), "M1_date": latest_num.get("M1_observation_date"),
+                "V": latest_num.get("V"), "V_date": latest_num.get("V_observation_date"), "P": None, "P_date": None,
+                "Q": None, "Q_date": None, "numerator_alpha_M1_V": latest_num.get("value"),
+                "numerator_history": numerator_history, "A_over_M_objective": None, "A_over_M_buyer": None,
+                "source_status": "NO_COMMON_OBSERVATIONS", "source_notes": "P/Q 的共同期序列不齐；独立分子历史仍保留。"}
+    as_of = eligible[-1]
+    obs = {k: _latest_row_on_or_before(v, as_of) for k, v in series.items()}
+    if any(obs[k] is None for k in keys):
+        return {"as_of_date": latest_num.get("date") or as_of, "alpha_proxy": latest_num.get("alpha_proxy"),
+                "alpha_definition": "企业税后利润 CPATAX / 名义 GDP；透明公开数据代理，不等同于理论 α 的直接观测",
+                "M1": latest_num.get("M1"), "M1_date": latest_num.get("M1_observation_date"),
+                "V": latest_num.get("V"), "V_date": latest_num.get("V_observation_date"), "P": None, "P_date": None,
+                "Q": None, "Q_date": None, "numerator_alpha_M1_V": latest_num.get("value"),
+                "numerator_history": numerator_history, "A_over_M_objective": None, "A_over_M_buyer": None,
+                "source_status": "NO_COMMON_OBSERVATIONS", "source_notes": "找不到共同日期；保留独立分子历史序列。"}
+    profit = float(obs["CORPORATE_PROFIT_AFTER_TAX"]["value"])
+    gdp = float(obs["NOMINAL_GDP"]["value"])
+    alpha = profit / gdp if gdp > 0 else None
+    if alpha is not None and (not math.isfinite(alpha) or not 0 <= alpha <= 1):
+        alpha = None
+    return {"as_of_date": as_of, "alpha_proxy": alpha,
+            "alpha_definition": "企业税后利润 CPATAX / 名义 GDP；透明公开数据代理，不等同于理论 α 的直接观测",
+            "M1": obs["M1"]["value"], "M1_date": obs["M1"]["date"],
+            "V": obs["V_M1"]["value"], "V_date": obs["V_M1"]["date"],
+            "P": obs["P_GDP_DEFLATOR"]["value"], "P_date": obs["P_GDP_DEFLATOR"]["date"],
+            "Q": obs["Q_REAL_GDP"]["value"], "Q_date": obs["Q_REAL_GDP"]["date"],
+            "corporate_profit_after_tax": profit, "corporate_profit_date": obs["CORPORATE_PROFIT_AFTER_TAX"]["date"],
+            "nominal_gdp": gdp, "nominal_gdp_date": obs["NOMINAL_GDP"]["date"],
+            "M1_unit": "USD billions (10^9 USD)", "V_unit": "dimensionless ratio", "P_unit": "GDP deflator index (2017=100)", "Q_unit": "Billions of chained 2017 USD, SAAR",
+            "A_over_M_objective": None, "A_over_M_buyer": None,
+            "numerator_alpha_M1_V": latest_num.get("value"),
+            "numerator_history": numerator_history,
+            "source_status": "READY" if alpha is not None else "ALPHA_PROXY_INVALID",
+            "source_notes": "M1、V、P、Q 来自 FRED；α 以企业税后利润/GDP作为操作性代理，界面将明确标注。"}
+
+
+def _build_objective_gravity_history(cape_rows: list[dict[str, Any]], nominal_yield_rows: list[dict[str, Any]], tbill_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Build nominal-basis objective R from trailing realized data.
+
+    g_10y = nominal Shiller earnings-per-share CAGR over the same 10-year window.
+    R_objective = nominal 10-year Treasury yield + AEL normalized ERP (4.2%) - g_10y.
+    Trailing realized ERP versus 3-month T-bills is retained as a diagnostic only;
+    it no longer mechanically drives objective gravity.
+    """
+    if len(cape_rows) < 121 or not nominal_yield_rows or not tbill_rows:
+        return []
+    def latest_le(rows, dt):
+        return next((x for x in reversed(rows) if x.get("date", "") <= dt), None)
+    by_date = {r.get("date"): r for r in cape_rows if r.get("date")}
+    out = []
+    for i, row in enumerate(cape_rows):
+        if not row.get("date") or row.get("price") is None or row.get("nominal_earnings") is None or row["nominal_earnings"] <= 0:
+            continue
+        dt = date.fromisoformat(row["date"])
+        prior_candidates = []
+        for prior in cape_rows[:i]:
+            if prior.get("price") is None or prior.get("nominal_earnings") is None or prior["nominal_earnings"] <= 0:
+                continue
+            try:
+                pd = date.fromisoformat(prior["date"])
+            except Exception:
+                continue
+            months = (dt.year - pd.year) * 12 + dt.month - pd.month
+            if 118 <= months <= 122:
+                prior_candidates.append((abs(months - 120), prior))
+        if not prior_candidates:
+            continue
+        prior = min(prior_candidates, key=lambda z: z[0])[1]
+        window = [x for x in cape_rows if prior["date"] <= x.get("date", "") <= row["date"] and x.get("price") is not None]
+        if len(window) < 118:
+            continue
+        equity_growth = 1.0
+        cash_growth = 1.0
+        valid_months = 0
+        for j in range(1, len(window)):
+            prev, cur = window[j-1], window[j]
+            if not prev.get("price") or cur.get("price") is None:
+                continue
+            dividend = cur.get("dividend") or 0.0
+            monthly_total_return = (cur["price"] + dividend / 12.0) / prev["price"]
+            if monthly_total_return <= 0:
+                continue
+            bill = latest_le(tbill_rows, cur["date"])
+            if not bill or bill.get("value") is None:
+                continue
+            equity_growth *= monthly_total_return
+            cash_growth *= (1.0 + float(bill["value"]) / 100.0) ** (1.0 / 12.0)
+            valid_months += 1
+        if valid_months < 118:
+            continue
+        years = valid_months / 12.0
+        equity_return = (equity_growth ** (1.0 / years) - 1.0) * 100.0
+        cash_return = (cash_growth ** (1.0 / years) - 1.0) * 100.0
+        erp = equity_return - cash_return
+        g = (row["nominal_earnings"] / prior["nominal_earnings"]) ** (1.0 / years) * 100.0 - 100.0
+        rf_row = latest_le(nominal_yield_rows, row["date"])
+        if not rf_row or rf_row.get("value") is None:
+            continue
+        erp_normalized = OBJECTIVE_ERP_NORMALIZED_PCT
+        r_obj = float(rf_row["value"]) + erp_normalized - g
+        out.append({"date": row["date"], "value": round(r_obj, 6) if r_obj > 0 else None,
+                    "raw_formula_result_pct": round(r_obj, 6), "valid_for_gravity": r_obj > 0, "R_objective": round(r_obj, 6),
+                    "rf_nominal_pct": float(rf_row["value"]), "rf_date": rf_row["date"],
+                    "erp_objective_pct": erp_normalized, "erp_objective_method": OBJECTIVE_ERP_METHOD,
+                    "erp_realized_10y_pct": erp, "equity_total_return_10y_pct": equity_return,
+                    "cash_return_10y_pct": cash_return, "g_nominal_earnings_10y_pct": g,
+                    "window_start": prior["date"], "window_end": row["date"],
+                    "horizon_years": round(years, 3), "basis": "nominal",
+                    "source": "Robert Shiller monthly S&P 500 P/D/E + FRED TB3MS + FRED DGS10",
+                    "available_date_proxy": (dt + timedelta(days=45)).isoformat()})
+    return out
+
+
+
+def _build_objective_gravity_proxy_history(spy_rows: list[dict[str, Any]], nominal_yield_rows: list[dict[str, Any]],
+                                           tbill_rows: list[dict[str, Any]], profit_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Fallback objective R when Shiller P/D/E workbook is unavailable.
+
+    Uses SPY adjusted close (dividend-adjusted S&P 500 ETF total-return proxy),
+    same-window compounded 3-month T-bill returns, and nominal after-tax corporate
+    profits CPATAX CAGR as a disclosed broad-earnings proxy. This is NOT mislabeled
+    as Shiller EPS: every point carries quality/source metadata.
+    """
+    if len(spy_rows) < 121 or not nominal_yield_rows or not tbill_rows or not profit_rows:
+        return []
+    def latest_le(rows, dt):
+        return next((x for x in reversed(rows) if str(x.get('date',''))[:10] <= dt and _finite(x.get('value')) is not None), None)
+    # Reduce daily adjusted-close data to the last available trading day per month.
+    monthly = {}
+    for row in spy_rows:
+        dt = str(row.get('date',''))[:10]
+        try: date.fromisoformat(dt)
+        except Exception: continue
+        value = _finite(row.get('value'))
+        if value is not None and value > 0:
+            monthly[dt[:7]] = {'date': dt, 'price': value}
+    prices = [monthly[k] for k in sorted(monthly)]
+    if len(prices) < 121: return []
+    profits = sorted([{'date':str(r.get('date',''))[:10], 'value':_finite(r.get('value'))}
+                      for r in profit_rows if _finite(r.get('value')) is not None and _finite(r.get('value')) > 0], key=lambda x:x['date'])
+    out=[]
+    for i, row in enumerate(prices):
+        dt=row['date']; d=date.fromisoformat(dt)
+        prior_candidates=[]
+        for prior in prices[:i]:
+            pd=date.fromisoformat(prior['date']); months=(d.year-pd.year)*12+d.month-pd.month
+            if 118 <= months <= 122: prior_candidates.append((abs(months-120),prior,months))
+        if not prior_candidates: continue
+        _,base,months=min(prior_candidates,key=lambda z:z[0])
+        window=[x for x in prices if base['date'] <= x['date'] <= dt]
+        if len(window)<118: continue
+        # Use dividend-adjusted ETF price; annualized 10Y total return proxy.
+        years=months/12.0
+        equity=((row['price']/base['price'])**(1.0/years)-1.0)*100.0
+        cash_growth=1.0; cash_months=0; valid=True
+        for j in range(1,len(window)):
+            cur=window[j]
+            bill=latest_le(tbill_rows,cur['date'])
+            if not bill or _finite(bill.get('value')) is None:
+                valid=False; break
+            rate=float(bill['value'])
+            if rate <= -100: valid=False; break
+            cash_growth *= (1.0+rate/100.0)**(1.0/12.0); cash_months+=1
+        if not valid or cash_months < 118: continue
+        cash=(cash_growth**(1.0/years)-1.0)*100.0
+        erp=equity-cash
+        target=(d.replace(year=d.year-10) if not (d.month==2 and d.day==29) else d.replace(year=d.year-10,day=28)).isoformat()
+        profit_now=latest_le(profits,dt); profit_base=latest_le(profits,target)
+        if not profit_now or not profit_base or profit_now['value']<=0 or profit_base['value']<=0: continue
+        elapsed=(date.fromisoformat(profit_now['date'])-date.fromisoformat(profit_base['date'])).days/365.2425
+        if elapsed<9.5: continue
+        g=((profit_now['value']/profit_base['value'])**(1.0/elapsed)-1.0)*100.0
+        rf=latest_le(nominal_yield_rows,dt)
+        if not rf: continue
+        erp_normalized=OBJECTIVE_ERP_NORMALIZED_PCT
+        rval=float(rf['value'])+erp_normalized-g
+        if not all(math.isfinite(v) for v in (equity,cash,erp,g,rval)): continue
+        out.append({'date':dt,'value':round(rval,6) if rval>0 else None,'R_objective':round(rval,6),
+                    'raw_formula_result_pct':round(rval,6),'rf_nominal_pct':float(rf['value']),'rf_date':rf['date'],
+                    'erp_objective_pct':erp_normalized,'erp_objective_method':OBJECTIVE_ERP_METHOD,
+                    'erp_realized_10y_pct':round(erp,6),'equity_total_return_10y_pct':round(equity,6),
+                    'cash_return_10y_pct':round(cash,6),'g_nominal_earnings_10y_pct':round(g,6),
+                    'window_start':base['date'],'window_end':dt,'horizon_years':round(years,3),'basis':'nominal',
+                    'quality':'PROXY_SPY_TOTAL_RETURN_CPATAX_GROWTH','valid_for_gravity':rval>0,
+                    'source':'Yahoo Finance SPY adjusted close + FRED TB3MS + FRED CPATAX + DGS10',
+                    'source_note':'备用口径：SPY复权价格代表含分红总回报；g使用名义企业税后利润CPATAX十年CAGR，不等于Shiller名义EPS增长。',
+                    'available_date_proxy':(d+timedelta(days=120)).isoformat()})
+    return out
+
+def _metrics_bundle(index: str, raw: dict[str, Any]) -> dict[str, Any]:
+    today = date.today().isoformat()
+    buffett = raw.get("buffett") or {}
+    cape_rows = raw.get("cape") or []
+    real_yield = raw.get("real_yield") or {}
+    nominal_yield = raw.get("nominal_yield") or {}
+    cape_row = cape_rows[-1] if cape_rows else None
+    if not cape_row:
+        cape_latest = None
+        cape_pctl = None
+        cape_hist = []
+    else:
+        cape_latest = cape_row.get("cape")
+        cape_pctl = _percentile(cape_latest, [r["cape"] for r in cape_rows if r.get("cape") is not None])
+        cape_hist = [{"date": r["date"], "value": r["cape"]} for r in cape_rows if r.get("cape") is not None]
+    bcurrent = buffett.get("current") if buffett else None
+    # A broad Z.1 equity-liability proxy is not the listed-market-cap Buffett
+    # indicator. Keep it out of the canonical value/history chart when the
+    # World Bank series is unavailable; report source status instead.
+    bhistory = (buffett.get("history") or []) if buffett and buffett.get("frequency") != "quarterly_proxy" else []
+    bvalue = bcurrent.get("value") if bcurrent else None
+    bpctl = _percentile(bvalue, [r["value"] for r in bhistory if r.get("value") is not None])
+    y10_real = real_yield.get("value")
+    y10_nominal = nominal_yield.get("value")
+    macro_obs = raw.get("macro_observables") or {}
+    macro_model = _macro_model_values(macro_obs)
+    cape_asof = cape_row.get("date") if cape_row else None
+    nominal_yield_rows = nominal_yield.get("history") or []
+    tbill_yield = raw.get("tbill_yield") or {}
+    tbill_rows = tbill_yield.get("history") or []
+    r_objective_history = _build_objective_gravity_history(cape_rows, nominal_yield_rows, tbill_rows)
+    objective_method = "SHILLER_EPS_STRICT" if any(_finite(x.get("value")) is not None and float(x["value"]) > 0 for x in r_objective_history) else None
+    if objective_method is None:
+        # Do not leave R客观 blank solely because the Shiller workbook fell back to CAPE-only.
+        # Build a separately labelled realized-return / corporate-profit proxy from public sources.
+        try:
+            spy_rows = _yahoo_history("SPY", start=date(1993, 1, 1), force=bool(raw.get("force", False)))
+            profit_rows = (macro_obs.get("CORPORATE_PROFIT_AFTER_TAX") or {}).get("history") or []
+            proxy_history = _build_objective_gravity_proxy_history(spy_rows, nominal_yield_rows, tbill_rows, profit_rows)
+            if proxy_history:
+                r_objective_history = proxy_history
+                objective_method = "PROXY_SPY_TOTAL_RETURN_CPATAX_GROWTH"
+        except Exception as exc:
+            raw.setdefault("errors", []).append(f"R客观备用历史序列：{str(exc)[:160]}")
+    valid_objective_rows = [x for x in r_objective_history if _finite(x.get("value")) is not None and float(x["value"]) > 0]
+    latest_objective = valid_objective_rows[-1] if valid_objective_rows else None
+    latest_objective_raw = r_objective_history[-1] if r_objective_history else None
+    obj_g = latest_objective.get("g_nominal_earnings_10y_pct") if latest_objective else None
+    obj_erp_realized = latest_objective.get("erp_realized_10y_pct") if latest_objective else None
+    obj_erp = latest_objective.get("erp_objective_pct", OBJECTIVE_ERP_NORMALIZED_PCT) if latest_objective else None
+    r_obj = latest_objective.get("R_objective") if latest_objective else None
+    objective_yield = latest_objective.get("rf_nominal_pct") if latest_objective else y10_nominal
+    objective_yield_date = latest_objective.get("rf_date") if latest_objective else (nominal_yield.get("date") if nominal_yield else None)
+    buyer = raw.get("buyer") or {}
+    summary = buyer.get("summary") or {}
+    erp_buyer = _finite(summary.get("buyer_erp_pct"))
+    g_buyer = _finite(summary.get("buyer_g_pct"))
+    buyer_date = summary.get("as_of_date")
+    buyer_basis = summary.get("return_basis")
+    buyer_horizon = _finite(summary.get("horizon_years"))
+    buyer_source_age_days = None
+    try:
+        buyer_source_age_days = (date.fromisoformat(today) - date.fromisoformat(str(buyer_date)[:10])).days
+    except Exception:
+        pass
+    # Current buyer-side value is suppressed if the source is stale or bases do not match.
+    # Historical buyer values can still be used at their original date in year-backtests.
+    cape_buyer_gap = None
+    try:
+        if buyer_date and cape_asof:
+            cape_buyer_gap = abs((date.fromisoformat(str(buyer_date)[:10]) - date.fromisoformat(str(cape_asof)[:10])).days)
+    except Exception:
+        pass
+    # Both R series use a nominal basis: nominal Rf + nominal ERP - nominal g.
+    # Real-basis observations must not be mixed into this calculation.
+    buyer_horizon_match = buyer_horizon is not None and abs(buyer_horizon - 10.0) <= 1.0
+    buyer_basis_match = buyer_basis == "nominal"
+    buyer_date_fresh = buyer_source_age_days is not None and 0 <= buyer_source_age_days <= 180
+    buyer_date_aligned = cape_buyer_gap is not None and cape_buyer_gap <= 45
+    buyer_fresh = buyer_date_fresh and buyer_date_aligned and buyer_horizon_match and buyer_basis_match
+    buyer_yield_rows = (nominal_yield.get("history") or []) if buyer_basis_match else []
+    buyer_yield_row = _latest_row_on_or_before(buyer_yield_rows, str(buyer_date)[:10]) if buyer_date else None
+    buyer_yield = buyer_yield_row.get("value") if buyer_yield_row else None
+    buyer_yield_date = buyer_yield_row.get("date") if buyer_yield_row else None
+    buyer_formula = None
+    r_buyer = None
+    theta = None
+    buyer_source_mode = "MATCHED_INSTITUTIONAL"
+    if erp_buyer is not None and g_buyer is not None and buyer_yield is not None and buyer_fresh:
+        r_buyer = buyer_yield + erp_buyer - g_buyer
+        buyer_formula = "R_buyer_expected = matched nominal 10Y yield + institutional nominal ERP - forward-looking nominal g"
+        if r_obj is not None and abs(r_buyer) >= 0.25:
+            theta = r_obj / r_buyer
+    # If the private institutional archive is inaccessible/unmappable, use the official
+    # Philadelphia Fed SPF as a clearly labelled professional-forecaster proxy so the US
+    # Rbuyer multi-decade trend is still available. Never label this as private buy-side data.
+    spf_buyer_history = []
+    if not r_buyer:
+        try:
+            from pro_gravity_countries import _fetch_spf_buyer_history
+            spf_buyer_history = _fetch_spf_buyer_history(force=False)
+            usable_spf = [x for x in spf_buyer_history if _finite(x.get("value")) is not None and _finite(x.get("value")) > 0]
+            if usable_spf:
+                spf_latest = usable_spf[-1]
+                r_buyer = float(spf_latest["value"])
+                erp_buyer = _finite(spf_latest.get("erp_buyer_pct"))
+                g_buyer = _finite(spf_latest.get("g_buyer_pct"))
+                buyer_date = spf_latest.get("date")
+                buyer_basis = "nominal"
+                buyer_horizon = 10.0
+                buyer_source_mode = "SPF_PROFESSIONAL_FORECASTER_PROXY"
+                buyer_formula = "SPF STOCK10 - nominal GDP growth proxy; professional-forecaster consensus, not private fund buy-side"
+                if r_obj is not None and abs(r_buyer) >= 0.25: theta = r_obj / r_buyer
+        except Exception as exc:
+            raw.setdefault("errors", []).append(f"R买方 SPF 备用源：{str(exc)[:150]}")
+    matched_buyer_history = _build_point_in_time_gravity_history(
+        cape_rows, nominal_yield.get("history") or [], buyer.get("records") or [], date.today(),
+        objective_history=r_objective_history)
+    r_actual_history = [{"date": x["signal_date"], "value": x["R_actual"],
+                         "source_observation_date": x["buyer_observation_date"], "quality":"MATCHED_INSTITUTIONAL"} for x in matched_buyer_history]
+    theta_history = [{"date": x["signal_date"], "value": x["Theta"],
+                      "source_observation_date": x["buyer_observation_date"]}
+                     for x in matched_buyer_history if x.get("Theta") is not None]
+    if not r_actual_history and spf_buyer_history:
+        r_actual_history = [{"date":x.get("date"),"value":x.get("value"),"source_observation_date":x.get("date"),
+                             "quality":"SPF_PROFESSIONAL_FORECASTER_PROXY","source":x.get("source"),"note":x.get("note")}
+                            for x in spf_buyer_history if _finite(x.get("value")) is not None and _finite(x.get("value"))>0]
+        # Historical Theta is computed only where a dated objective observation exists.
+        for bp in r_actual_history:
+            obj_candidates=[x for x in r_objective_history if str(x.get("date",""))[:10] <= str(bp.get("date",""))[:10] and _finite(x.get("value")) is not None and float(x["value"])>0]
+            if obj_candidates and abs(float(bp["value"]))>=0.25:
+                obj=obj_candidates[-1]
+                theta_history.append({"date":bp["date"],"value":float(obj["value"])/float(bp["value"]),
+                                      "source_observation_date":bp["date"],"quality":"SPF_PROXY_THETA"})
+    alpha_m1_v_history = macro_model.get("numerator_history") or []
+    latest_verified_gravity = matched_buyer_history[-1] if matched_buyer_history else None
+    latest_verified_age_days = None
+    if latest_verified_gravity:
+        try:
+            latest_verified_age_days = (date.today() - date.fromisoformat(latest_verified_gravity["signal_date"])).days
+        except Exception:
+            latest_verified_age_days = None
+    r_objective_values = [x["value"] for x in r_objective_history if x.get("value") is not None]
+    r_actual_values = [x["value"] for x in r_actual_history if x.get("value") is not None]
+    theta_values = [x["value"] for x in theta_history if x.get("value") is not None]
+    if buyer_source_mode == "SPF_PROFESSIONAL_FORECASTER_PROXY":
+        buyer_status = "SPF_PROFESSIONAL_FORECASTER_PROXY"
+    elif raw.get("buyer") is not None:
+        buyer_status = buyer.get("status", "UNKNOWN")
+        if erp_buyer is not None and g_buyer is not None:
+            if not buyer_basis_match:
+                buyer_status = "RETURN_BASIS_MISMATCH"
+            elif not buyer_horizon_match:
+                buyer_status = "HORIZON_MISMATCH"
+            elif not buyer_date_fresh:
+                buyer_status = "STALE_SOURCE"
+            elif not buyer_date_aligned:
+                buyer_status = "SOURCE_DATE_MISMATCH"
+            elif buyer_yield is None:
+                buyer_status = "RISK_FREE_YIELD_UNAVAILABLE"
+    else:
+        buyer_status = "NOT_STARTED"
+    if macro_model.get("numerator_alpha_M1_V") is not None:
+        numerator = macro_model["numerator_alpha_M1_V"]
+        macro_model["numerator_alpha_M1_V"] = numerator
+        macro_model["numerator_history_count"] = len(alpha_m1_v_history)
+        # A/M objective is enabled only when the same-date realized nominal
+        # ERP/g objective chain is available and R is positive.
+        macro_model["A_over_M_objective"] = None
+        macro_model["A_over_M_objective_status"] = "BLOCKED_UNTIL_VALID_OBJECTIVE_R"
+        macro_model["A_over_M_buyer"] = numerator / (r_buyer / 100.0) if r_buyer is not None and r_buyer > 0 else None
+        macro_model["A_over_M_unit"] = "USD billions (10^9 USD; model-implied capitalization proxy, not a dimensionless ratio)"
+        macro_model["A_over_M_formula"] = "(alpha_proxy_fraction * M1_USD_billions * V) / (R_percent/100); R must be positive; output unit USD billions"
+    elif macro_model.get("alpha_proxy") is not None and macro_model.get("M1") is not None and macro_model.get("V") is not None:
+        numerator = macro_model["alpha_proxy"] * macro_model["M1"] * macro_model["V"]
+        macro_model["numerator_alpha_M1_V"] = numerator
+        macro_model["numerator_history_count"] = len(alpha_m1_v_history)
+        macro_model["A_over_M_objective"] = None
+        macro_model["A_over_M_objective_status"] = "BLOCKED_UNTIL_VALID_OBJECTIVE_R"
+        macro_model["A_over_M_buyer"] = numerator / (r_buyer / 100.0) if r_buyer is not None and r_buyer > 0 else None
+        macro_model["A_over_M_unit"] = "USD billions (10^9 USD; model-implied capitalization proxy, not a dimensionless ratio)"
+        macro_model["A_over_M_formula"] = "(alpha_proxy_fraction * M1_USD_billions * V) / (R_percent/100); R must be positive; output unit USD billions"
+    index_meta = INDEXES.get(index, INDEXES["SP500"])
+    return {
+        "ok": True, "module": "AEL_PRO_AUTOMATIC_DOUBLE_GRAVITY", "version": "2.6.61-OBJECTIVE-GRAVITY-ERP-NORMALIZED",
+        "as_of": _now_utc(), "requested_index": index, "index_name": index_meta["name"], "index_symbol": index_meta["symbol"],
+        "metrics": {
+            "buffett_indicator_pct_gdp": round(bvalue, 3) if bvalue is not None else None,
+            "buffett_percentile": bpctl, "buffett_observation_date": bcurrent.get("date") if bcurrent else None,
+            "buffett_definition": (bcurrent.get("method") or bcurrent.get("source") or buffett.get("definition_warning") if bcurrent else "无通过校验的当前巴菲特型指标"),
+            "buffett_frequency": buffett.get("frequency", "unknown"),
+            "buffett_quality_warning": ("数值超过 350%，超出可比口径校验范围，已阻断显示。" if bvalue is not None and bvalue > 350 else (buffett.get("definition_warning") if bcurrent and buffett.get("frequency") == "quarterly_proxy" else None)),
+            "buffett_anchor_date": bcurrent.get("anchor_date") if bcurrent else None,
+            "cape": round(cape_latest, 3) if cape_latest is not None else None,
+            "cape_percentile": cape_pctl, "cape_observation_date": cape_row.get("date") if cape_row else None,
+            "cape_scope": "Shiller 官方 CAPE 为美国标普 500 市场估值基准；选纳指/道指时作为共同市场参考，不冒充指数专属 CAPE。",
+            "risk_free_real_10y_pct": round(y10_real, 4) if y10_real is not None else None,
+            "risk_free_nominal_10y_pct": round(y10_nominal, 4) if y10_nominal is not None else None,
+            "risk_free_observation_date": nominal_yield.get("date") if nominal_yield else None,
+            "risk_free_yield_for_objective_pct": round(objective_yield, 4) if objective_yield is not None else None,
+            "objective_yield_observation_date": objective_yield_date,
+            "buyer_to_cape_date_gap_days": cape_buyer_gap,
+            "alpha_proxy_pct": round(macro_model["alpha_proxy"] * 100.0, 4) if macro_model.get("alpha_proxy") is not None else None,
+            "alpha_proxy_date": macro_model.get("as_of_date"),
+            "alpha_proxy_definition": macro_model.get("alpha_definition"),
+            "M1_money_stock": macro_model.get("M1"), "M1_observation_date": macro_model.get("M1_date"),
+            "V_M1_velocity": macro_model.get("V"), "V_observation_date": macro_model.get("V_date"),
+            "P_GDP_deflator": macro_model.get("P"), "P_observation_date": macro_model.get("P_date"),
+            "Q_real_gdp_billions": macro_model.get("Q"), "Q_observation_date": macro_model.get("Q_date"),
+            "numerator_alpha_M1_V_billions": round(macro_model["numerator_alpha_M1_V"], 4) if macro_model.get("numerator_alpha_M1_V") is not None else None,
+            "numerator_alpha_M1_V_date": alpha_m1_v_history[-1]["date"] if alpha_m1_v_history else None,
+            "alpha_M1_V_history_count": len(alpha_m1_v_history),
+            "A_over_M_objective_billions": round(macro_model["A_over_M_objective"], 4) if macro_model.get("A_over_M_objective") is not None else None,
+            "A_over_M_buyer_billions": round(macro_model["A_over_M_buyer"], 4) if macro_model.get("A_over_M_buyer") is not None else None,
+            "A_over_M_unit": macro_model.get("A_over_M_unit"), "A_over_M_source_status": macro_model.get("source_status"),
+            "erp_objective_pct": round(obj_erp, 4) if obj_erp is not None else None,
+            "erp_objective_method": OBJECTIVE_ERP_METHOD if obj_erp is not None else None,
+            "erp_realized_10y_diagnostic_pct": round(obj_erp_realized, 4) if obj_erp_realized is not None else None,
+            "g_objective_pct": round(obj_g, 4) if obj_g is not None else None,
+            "g_objective_definition": ("Shiller 名义每股盈利 E 的过去 10 年 CAGR；与名义 Rf、名义 ERP 同口径，是客观后向增长代理，不是未来增长预测。" if objective_method == "SHILLER_EPS_STRICT" else ("备用口径：FRED CPATAX 名义企业税后利润过去 10 年 CAGR；不是每股盈利 EPS，作为严格 Shiller P/D/E 缺失时的透明代理。" if objective_method == "PROXY_SPY_TOTAL_RETURN_CPATAX_GROWTH" else "缺少可核验的十年名义盈利增长序列。")),
+            "R_objective_pct": round(r_obj, 4) if r_obj is not None else None,
+            "R_objective_source_note": ("Shiller P/D/E 严格口径" if objective_method == "SHILLER_EPS_STRICT" else ("SPY复权总回报 + CPATAX名义企业利润增长备用代理；不是EPS口径" if objective_method == "PROXY_SPY_TOTAL_RETURN_CPATX_GROWTH" else "客观R缺少完整历史数据")),
+            "R_objective_method": objective_method,
+            "R_buyer_method": buyer_source_mode,
+            "R_objective_percentile": _percentile(r_obj, r_objective_values),
+            "R_actual_percentile": _percentile(r_buyer if r_buyer is not None else (latest_verified_gravity.get("R_actual") if latest_verified_gravity else None), r_actual_values),
+            "R_buyer_expected_percentile": _percentile(r_buyer if r_buyer is not None else (latest_verified_gravity.get("R_actual") if latest_verified_gravity else None), r_actual_values),
+            "Theta_percentile": _percentile(theta if theta is not None else (latest_verified_gravity.get("Theta") if latest_verified_gravity else None), theta_values),
+            "latest_verified_history_date": latest_verified_gravity.get("signal_date") if latest_verified_gravity else None,
+            "latest_verified_R_actual_pct": round(latest_verified_gravity["R_actual"], 4) if latest_verified_gravity else None,
+            "latest_verified_R_objective_pct": round(latest_verified_gravity["R_objective"], 4) if latest_verified_gravity else None,
+            "latest_verified_Theta": round(latest_verified_gravity["Theta"], 6) if latest_verified_gravity and latest_verified_gravity.get("Theta") is not None else None,
+            "latest_verified_history_age_days": latest_verified_age_days,
+            "latest_verified_institution_count": latest_verified_gravity.get("institution_count") if latest_verified_gravity else None,
+            "latest_verified_horizon_years": latest_verified_gravity.get("horizon_years_median") if latest_verified_gravity else None,
+            "latest_verified_cape_gap_days": latest_verified_gravity.get("cape_date_gap_days") if latest_verified_gravity else None,
+            "R_objective_history_count": len(r_objective_history),
+            "R_actual_history_count": len(r_actual_history),
+            "Theta_history_count": len(theta_history),
+            "erp_buyer_pct": round(erp_buyer, 4) if erp_buyer is not None else None,
+            "g_buyer_pct": round(g_buyer, 4) if g_buyer is not None else None,
+            "R_actual_pct": round(r_buyer, 4) if r_buyer is not None else None,
+            "R_buyer_expected_pct": round(r_buyer, 4) if r_buyer is not None else None,
+            "buyer_source_mode": buyer_source_mode,
+            "Theta_actual_over_objective": round(theta, 6) if theta is not None else None,
+            "Theta_objective_over_actual": round(theta, 6) if theta is not None else None,
+            "buyer_gravity_state": ("NEGATIVE_GRAVITY_CANDIDATE" if r_buyer is not None and r_buyer < 0 else
+                                    "NEAR_ZERO" if r_buyer is not None and abs(r_buyer) < 0.25 else
+                                    "POSITIVE_GRAVITY" if r_buyer is not None else "UNAVAILABLE"),
+            "buyer_source_as_of": buyer_date,
+            "buyer_source_age_days": buyer_source_age_days,
+            "buyer_source_fresh": buyer_fresh,
+            "buyer_horizon_years": buyer_horizon,
+            "buyer_return_basis": buyer_basis,
+            "buyer_yield_observation_date": buyer_yield_date,
+            "buyer_institution_count": summary.get("institution_count"),
+            "buyer_source_status": buyer_status,
+        },
+        "sources": [
+            {"name": "World Bank listed domestic market capitalization / GDP (annual)", "url": "https://data.worldbank.org/indicator/CM.MKT.LCAP.GD.ZS?locations=US", "available": bool(bhistory) and buffett.get("frequency") == "annual", "last_observation": bhistory[-1]["date"] if bhistory else None},
+            {"name": "FRED Z.1 corporate-equity liabilities/GDP (proxy; not canonical Buffett indicator)", "url": "https://fred.stlouisfed.org/series/NCBEILQ027S", "available": False, "last_observation": None, "status": "仅诊断，不参与巴菲特指标展示"},
+            {"name": "Robert Shiller CAPE monthly data", "url": cape_row.get("source_url") if cape_row else SHILLER_URLS[0], "available": bool(cape_rows), "last_observation": cape_row.get("date") if cape_row else None},
+            {"name": "R客观必需字段：Shiller 月度价格 P + 名义每股盈利 E", "url": SHILLER_URLS[0],
+             "available": sum(1 for x in cape_rows if x.get("price") is not None and x.get("nominal_earnings") is not None and (x.get("nominal_earnings") or 0) > 0) >= 121,
+             "count": sum(1 for x in cape_rows if x.get("price") is not None and x.get("nominal_earnings") is not None and (x.get("nominal_earnings") or 0) > 0),
+             "last_observation": next((x.get("date") for x in reversed(cape_rows) if x.get("price") is not None and x.get("nominal_earnings") is not None), None),
+             "status": "完整 P/D/E 字段决定 R客观能否计算；CAPE-only 不能计算历史 ERP/g"},
+            {"name": "FRED 10-year real Treasury yield DFII10 (reference only)", "url": "https://fred.stlouisfed.org/series/DFII10", "available": y10_real is not None, "last_observation": real_yield.get("date") if real_yield else None},
+            {"name": "FRED 10-year nominal Treasury yield DGS10 (R_f input)", "url": "https://fred.stlouisfed.org/series/DGS10", "available": y10_nominal is not None, "last_observation": nominal_yield.get("date") if nominal_yield else None},
+            {"name": "FRED 3-month Treasury bill TB3MS (realized cash benchmark for ERP)", "url": "https://fred.stlouisfed.org/series/TB3MS", "available": bool(tbill_rows), "last_observation": tbill_yield.get("date") if tbill_yield else None},
+            {"name": "备用 R客观：SPY复权总回报 + FRED CPATAX名义企业利润增长", "url": "https://finance.yahoo.com/quote/SPY/history/", "available": objective_method == "PROXY_SPY_TOTAL_RETURN_CPATX_GROWTH", "last_observation": latest_objective.get("date") if latest_objective and objective_method == "PROXY_SPY_TOTAL_RETURN_CPATX_GROWTH" else None, "status": "仅当 Shiller P/D/E 严格口径不可用时启用；g为企业税后利润增长，不冒充EPS"},
+            {"name": "FRED M1 money stock M1SL", "url": "https://fred.stlouisfed.org/series/M1SL", "available": (macro_obs.get("M1") or {}).get("value") is not None, "last_observation": (macro_obs.get("M1") or {}).get("date")},
+            {"name": "FRED M1 velocity M1V", "url": "https://fred.stlouisfed.org/series/M1V", "available": (macro_obs.get("V_M1") or {}).get("value") is not None, "last_observation": (macro_obs.get("V_M1") or {}).get("date")},
+            {"name": "FRED GDP deflator GDPDEF", "url": "https://fred.stlouisfed.org/series/GDPDEF", "available": (macro_obs.get("P_GDP_DEFLATOR") or {}).get("value") is not None, "last_observation": (macro_obs.get("P_GDP_DEFLATOR") or {}).get("date")},
+            {"name": "FRED real GDP GDPC1", "url": "https://fred.stlouisfed.org/series/GDPC1", "available": (macro_obs.get("Q_REAL_GDP") or {}).get("value") is not None, "last_observation": (macro_obs.get("Q_REAL_GDP") or {}).get("date")},
+            {"name": "FRED corporate profits after tax CPATAX (alpha proxy)", "url": "https://fred.stlouisfed.org/series/CPATAX", "available": (macro_obs.get("CORPORATE_PROFIT_AFTER_TAX") or {}).get("value") is not None, "last_observation": (macro_obs.get("CORPORATE_PROFIT_AFTER_TAX") or {}).get("date")},
+            {"name": "Dahlquist-Ibert institutional return expectations", "url": MENDELEY_DATASET_URL, "available": erp_buyer is not None, "last_observation": buyer_date, "status": buyer_status},
+        ],
+        "series": {"buffett": [{"date": r["date"], "value": r["value"], "available_date_proxy": r.get("available_date_proxy")} for r in bhistory],
+                   "cape": cape_hist,
+                   "R_objective": r_objective_history,
+                   "R_actual": r_actual_history,
+                   "theta": theta_history,
+                   "alpha_M1_V": [{"date": r["date"], "value": r["value"], "alpha_proxy": r.get("alpha_proxy"), "M1": r.get("M1"), "V": r.get("V"), "corporate_profit_after_tax": r.get("corporate_profit_after_tax"), "nominal_gdp": r.get("nominal_gdp")} for r in alpha_m1_v_history]},
+        "buyer_source": {k: v for k, v in buyer.items() if k not in {"records"}},
+        "errors": raw.get("errors", []),
+        "data_semantics": {
+            "buffett": "US total corporate equity value / annualized nominal GDP; the latest value is updated daily using the S&P 500 as a scaling proxy.",
+            "cape": "Official Shiller S&P 500 CAPE; not an index-specific Nasdaq/Dow CAPE.",
+            "objective_erp": "Trailing 10-year annualized nominal S&P 500 total return minus compounded 3-month Treasury-bill return over the same window; realized historical ERP proxy, not CAPE-implied ERP.",
+            "objective_g": "Trailing ten-year nominal Shiller earnings-per-share E CAGR, backward-looking objective proxy.",
+            "R_objective": "Nominal DGS10 + trailing-10-year realized nominal ERP (S&P 500 total return minus compounded TB3MS cash return) - trailing-10-year nominal earnings CAGR; all inputs are source-dated and same-basis.",
+            "buyer": "Only explicit ERP or same-row equity-minus-cash expectation and explicitly forward-looking g fields with matching return basis/horizon qualify. Historical/observed growth is not relabelled as an expectation.",
+            "M1_V_P_Q": "FRED M1SL, M1V, GDPDEF and GDPC1 are aligned to a common as-of date. alpha proxy = CPATAX/GDP; this is an explicitly labelled operational proxy, not a direct observation of the theoretical alpha.",
+            "date_matching": "R客观使用同一过去十年窗口内的名义股票总回报、T-bill回报和名义盈利增长；Rf使用对应日期名义10年国债。R买方仅接受同日期、名义口径、约10年期限的机构ERP/g；历史回测按可用日期避免未来信息。",
+            "A_over_M": "Numerator alpha*M1*V is calculated quarterly from FRED CPATAX/GDP, M1SL, and M1V, aligned to a common historical date; plotted independently even if P/Q or R are unavailable. Monetary units are USD billions internally and displayed as T when >= 1000 billion. alpha remains an operational proxy, not a directly observed theoretical parameter. Complete historical A/M must only be joined after the specified R-objective ten-year realized ERP/g series is implemented.",
+            "Theta": "Theta = R_objective / R_actual. If |R_actual| < 0.25 percentage points, Theta is suppressed. A negative R_actual / Theta is a negative-gravity warning candidate, not automatic proof of a bubble.",
+            "no_manual_inputs": True,
+        },
+        "status": "READY" if bvalue is not None and cape_latest is not None and r_obj is not None and theta is not None else "PARTIAL_SOURCE_DATA",
+        "double_gravity_status": "READY" if theta is not None else ("PARTIAL_USING_SPF_PROXY" if r_buyer is not None else "WAITING_FOR_VALID_R_SERIES"),
+        "message": ("R客观使用Shiller严格口径或明确标注的SPY总回报/企业税后利润备用口径；R买方优先机构记录，缺失时用费城联储SPF专业预测者代理，绝不冒充私人买方调查。" if theta is None else "双重重力已更新；R买方来源类型已标注。Theta 是两项 R 的比值，不是上涨概率。"),
+    }
+
+
+def automatic_dashboard(index: str = "SP500", force: bool = False) -> dict[str, Any]:
+    idx = index.upper()
+    if idx not in INDEXES:
+        idx = "SP500"
+    try:
+        raw = _safe_get_data(force)
+        # The macro bundle can be cached while the institutional ZIP is downloading.
+        # Refresh the lightweight source status separately so the UI sees completion without a 6h wait.
+        raw["buyer"] = _get_buyer_status(start_if_missing=True, force_retry=force)
+        return _metrics_bundle(idx, raw)
+    except Exception as exc:
+        buyer = _get_buyer_status(start_if_missing=True, force_retry=force)
+        return {"ok": False, "module": "AEL_PRO_AUTOMATIC_DOUBLE_GRAVITY", "version": "2.6.61-OBJECTIVE-GRAVITY-ERP-NORMALIZED",
+                "requested_index": idx, "status": "SOURCE_ERROR", "message": "自动指标源暂不可用，正在保留可追溯的错误信息；不需要也不允许手动填数。",
+                "error": str(exc)[:300], "buyer_source": {k:v for k,v in buyer.items() if k != "records"},
+                "sources": [{"name":"Mendeley institutional expectations", "url": MENDELEY_DATASET_URL}]}
+
+
+def _build_point_in_time_gravity_history(
+    cape_rows: list[dict[str, Any]],
+    nominal_yield_rows: list[dict[str, Any]],
+    buyer_records: list[dict[str, Any]],
+    cutoff: date,
+    *,
+    cape_release_lag_days: int = 30,
+    buyer_release_lag_days: int = 30,
+    max_match_gap_days: int = 45,
+    objective_history: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Build matched historical R/Theta only from rows plausibly available by cutoff.
+
+    This is deliberately conservative because the archived survey date is not always
+    a separately recorded publication timestamp. A 30-day availability proxy is used
+    for both monthly CAPE data and institutional source observations; the source dates
+    and the proxy availability dates are returned for audit.
+    """
+    # Use only the computed trailing-ten-year realized nominal ERP/g series.
+    # Never substitute CAPE-implied ERP for realized ERP.
+    objective_rows: list[dict[str, Any]] = objective_history or []
+
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in buyer_records:
+        try:
+            obs_date = date.fromisoformat(str(row.get("date", ""))[:10])
+        except Exception:
+            continue
+        available = obs_date + timedelta(days=buyer_release_lag_days)
+        horizon = _finite(row.get("horizon_years"))
+        if (available > cutoff or row.get("erp_basis") != "nominal" or row.get("growth_basis") != "nominal"
+                or horizon is None or abs(horizon - 10.0) > 1.0
+                or _finite(row.get("buyer_erp_pct")) is None or _finite(row.get("buyer_g_pct")) is None):
+            continue
+        grouped.setdefault(obs_date.isoformat(), []).append({**row, "available_date_proxy": available.isoformat()})
+
+    result = []
+    for buyer_date, rows in sorted(grouped.items()):
+        bdate = date.fromisoformat(buyer_date)
+        obj_candidates = [o for o in objective_rows if o["date"] <= buyer_date
+                          and (bdate - date.fromisoformat(o["date"])).days <= max_match_gap_days
+                          and date.fromisoformat(o.get("available_date_proxy", o["date"])) <= date.fromisoformat(rows[0]["available_date_proxy"])]
+        if not obj_candidates:
+            continue
+        obj = obj_candidates[-1]
+        rf_row = _latest_row_on_or_before(nominal_yield_rows, buyer_date)
+        rf = rf_row.get("value") if rf_row else None
+        if rf is None:
+            continue
+        erp_b = statistics.median(float(r["buyer_erp_pct"]) for r in rows)
+        g_b = statistics.median(float(r["buyer_g_pct"]) for r in rows)
+        rb = rf + erp_b - g_b
+        if abs(rb) >= 0.25:
+            theta = obj["R_objective"] / rb
+        else:
+            theta = None
+        result.append({"signal_date": max(date.fromisoformat(rows[0]["available_date_proxy"]),
+                                           date.fromisoformat(obj["available_date_proxy"])).isoformat(),
+                       "buyer_observation_date": buyer_date,
+                       "objective_observation_date": obj["date"],
+                       "buyer_available_date_proxy": rows[0]["available_date_proxy"],
+                       "objective_available_date_proxy": obj.get("available_date_proxy", obj["date"]),
+                       "cape_date_gap_days": (bdate - date.fromisoformat(obj["date"])).days,
+                       "horizon_years_median": statistics.median(float(r["horizon_years"]) for r in rows),
+                       "institution_count": len({r.get("institution") for r in rows}),
+                       "R_actual": rb, "R_objective": obj["R_objective"], "Theta": theta,
+                       "ERP_buyer": erp_b, "g_buyer": g_b, "risk_free_nominal": rf,
+                       "CAPE": obj["cape"], "g_objective": obj["g_objective"]})
+    return sorted(result, key=lambda x: x["signal_date"])
+
+
+def automatic_year_backtest(year: int, index: str = "SP500", metric: str = "cape", force: bool = False) -> dict[str, Any]:
+    idx = index.upper()
+    if idx not in INDEXES:
+        return {"ok": False, "error": "指数仅支持 SP500、NASDAQ、DOW"}
+    if metric not in {"buffett", "cape", "R_actual", "R_objective", "theta"}:
+        return {"ok": False, "error": "指标仅支持 buffett、cape、R_actual、R_objective、theta"}
+    today = date.today()
+    if year < 1900 or year > today.year:
+        return {"ok": False, "error": f"年份须在 1900 至 {today.year} 之间"}
+    raw = _safe_get_data(force)
+    data = _metrics_bundle(idx, raw)
+    chosen = INDEXES[idx]
+    price_rows = _yahoo_history(chosen["symbol"], date(max(1900, year - 1), 1, 1), force)
+    target = date(year, 12, 31)
+    candidates = [r for r in price_rows if r["date"] <= target.isoformat()]
+    year_rows = [r for r in price_rows if r["date"][:4] == str(year)]
+    if not year_rows:
+        return {"ok": False, "error": f"{chosen['name']} 在 {year} 年没有可用的指数价格。"}
+    anchor = year_rows[-1]
+    anchor_date = date.fromisoformat(anchor["date"])
+    if not candidates:
+        return {"ok": False, "error": f"没有找到 {year} 年末之前的价格锚点。"}
+    # Values known at that year end (CAPE; Buffett uses only quarterly observations available by then).
+    cape_hist = raw.get("cape") or []
+    cands_cape = []
+    for r in cape_hist:
+        try:
+            cape_day = date.fromisoformat(str(r.get("date", ""))[:10])
+        except Exception:
+            continue
+        if cape_day + timedelta(days=30) <= target and _finite(r.get("cape")) is not None:
+            cands_cape.append(r)
+    cape_row = cands_cape[-1] if cands_cape else None
+    buffett_hist = ((raw.get("buffett") or {}).get("history") or [])
+    known_buffett = [r for r in buffett_hist if r.get("available_date_proxy", r["date"]) <= target.isoformat()]
+    buffett_row = known_buffett[-1] if known_buffett else None
+    value = None
+    if metric == "cape" and cape_row:
+        value = cape_row.get("cape")
+    elif metric == "buffett" and buffett_row:
+        value = buffett_row.get("value")
+    # Build only source/date/horizon-matched historical gravity signals available by year-end.
+    buyer_records = (raw.get("buyer") or {}).get("records") or []
+    matched_gravity_history = _build_point_in_time_gravity_history(
+        cape_hist, raw.get("real_yield", {}).get("history", []), buyer_records, target)
+    eligible_gravity = [r for r in matched_gravity_history if r["signal_date"] <= target.isoformat()]
+    gravity_row = eligible_gravity[-1] if eligible_gravity else None
+    obj_rows = []
+    for r in cape_hist:
+        try:
+            obs_date = date.fromisoformat(str(r.get("date", ""))[:10])
+        except Exception:
+            continue
+        # Shiller monthly rows are treated as available 30 days after their observation month.
+        if obs_date + timedelta(days=30) > target or r.get("cape") is None:
+            continue
+        y = _latest_real_yield_known(raw.get("real_yield", {}).get("history", []), obs_date.isoformat())
+        g = _growth_at_date(cape_hist, obs_date.isoformat())
+        if y is not None and g is not None:
+            erp = math.log1p(1.0 / r["cape"]) * 100 - y
+            rr = y + erp - g
+            obj_rows.append({"date": r["date"], "available_date_proxy": (obs_date + timedelta(days=30)).isoformat(),
+                             "R_objective": rr, "cape": r["cape"], "g": g, "real_yield": y})
+    obj_row = obj_rows[-1] if obj_rows else None
+    buyer_row = ({"date": gravity_row["buyer_observation_date"],
+                  "available_date_proxy": gravity_row["buyer_available_date_proxy"],
+                  "R_actual": gravity_row["R_actual"], "ERP": gravity_row["ERP_buyer"],
+                  "g": gravity_row["g_buyer"], "rf": gravity_row["risk_free_real"],
+                  "horizon_years": gravity_row["horizon_years_median"],
+                  "basis": "real", "institution_count": gravity_row["institution_count"]}
+                 if gravity_row else None)
+    # For year-specific R/Theta, use the latest genuinely matched joint signal.
+    selected_obj_row = ({"date": gravity_row["objective_observation_date"],
+                         "R_objective": gravity_row["R_objective"], "cape": gravity_row["CAPE"],
+                         "g": gravity_row["g_objective"]} if gravity_row else obj_row)
+    if metric == "R_objective" and selected_obj_row:
+        value = selected_obj_row["R_objective"]
+    elif metric == "R_actual" and buyer_row:
+        value = buyer_row["R_actual"]
+    elif metric == "theta" and gravity_row and gravity_row.get("Theta") is not None:
+        value = gravity_row["Theta"]
+    # forward returns use adjusted close when Yahoo supplies it; index series may only have close.
+    horizons = []
+    for years in (1, 3, 5, 10):
+        end_year = anchor_date.year + years
+        end_month = anchor_date.month
+        end_day = min(anchor_date.day, [31, 29 if end_year % 4 == 0 and (end_year % 100 != 0 or end_year % 400 == 0) else 28,31,30,31,30,31,31,30,31,30,31][end_month-1])
+        target_h = date(end_year, end_month, end_day)
+        end_rows = [r for r in price_rows if r["date"] >= target_h.isoformat()]
+        if target_h > today or not end_rows:
+            horizons.append({"years": years, "target_date": target_h.isoformat(), "actual_date": None,
+                             "return_pct": None, "status": "NOT_MATURED_OR_MISSING", "message": "期限尚未到期或来源没有覆盖该日期"})
+            continue
+        end = end_rows[0]
+        end_date = date.fromisoformat(end["date"])
+        elapsed = (end_date - anchor_date).days / 365.2425
+        ret = (end["value"] / anchor["value"] - 1) * 100
+        cagr = ((end["value"] / anchor["value"]) ** (1 / elapsed) - 1) * 100 if elapsed > 0 else None
+        horizons.append({"years": years, "target_date": target_h.isoformat(), "actual_date": end["date"],
+                         "return_pct": round(ret, 4), "cagr_pct": round(cagr, 4) if cagr is not None else None,
+                         "status": "OBSERVED", "price_series_used": end["kind"]})
+    metric_values = {
+        "buffett": buffett_row.get("value") if buffett_row else None,
+        "cape": cape_row.get("cape") if cape_row else None,
+        "R_actual": gravity_row.get("R_actual") if gravity_row else None,
+        "R_objective": gravity_row.get("R_objective") if gravity_row else (obj_row.get("R_objective") if obj_row else None),
+        "theta": gravity_row.get("Theta") if gravity_row else None,
+    }
+    hist_for_metric = []
+    if metric == "cape": hist_for_metric = [r["cape"] for r in cape_hist if r["date"] <= target.isoformat() and r.get("cape") is not None]
+    elif metric == "buffett": hist_for_metric = [r["value"] for r in buffett_hist if r.get("available_date_proxy", r["date"]) <= target.isoformat()]
+    elif metric == "R_objective": hist_for_metric = [r["R_objective"] for r in obj_rows]
+    elif metric == "R_actual": hist_for_metric = [r["R_actual"] for r in matched_gravity_history if r["signal_date"] <= target.isoformat()]
+    elif metric == "theta": hist_for_metric = [r["Theta"] for r in matched_gravity_history if r["signal_date"] <= target.isoformat() and r.get("Theta") is not None]
+    percentile = _percentile(value, hist_for_metric) if value is not None else None
+    selected_observation_date = ((cape_row or {}).get("date") if metric == "cape" else
+                                 ((buffett_row or {}).get("date") if metric == "buffett" else
+                                  ((gravity_row or {}).get("buyer_observation_date") if metric in {"R_actual", "theta"} else
+                                   ((selected_obj_row or {}).get("date") if metric == "R_objective" else None))))
+    return {
+        "ok": True, "module": "AEL_PRO_AUTOMATIC_YEAR_BACKTEST", "selected_year": year,
+        "index": idx, "index_name": chosen["name"], "index_symbol": chosen["symbol"],
+        "metric": metric, "metric_value": round(value, 5) if value is not None else None,
+        "metric_percentile_at_year": percentile,
+        "metric_observation_date": selected_observation_date,
+        "indicator_values": {k: round(v, 5) if v is not None else None for k, v in metric_values.items()},
+        "anchor_date": anchor["date"], "anchor_value": anchor["value"],
+        "price_series_used": "adjusted close when supplied by Yahoo; otherwise index close proxy",
+        "horizons": horizons,
+        "formal_theta_signal_available": bool(gravity_row and gravity_row.get("Theta") is not None),
+        "matched_theta_history_count": sum(1 for r in matched_gravity_history if r.get("Theta") is not None),
+        "buyer_historical_match": ({"buyer_observation_date": gravity_row.get("buyer_observation_date"),
+                                    "objective_observation_date": gravity_row.get("objective_observation_date"),
+                                    "signal_date": gravity_row.get("signal_date"),
+                                    "available_date_proxy": gravity_row.get("buyer_available_date_proxy"),
+                                    "horizon_years": gravity_row.get("horizon_years_median"),
+                                    "institution_count": gravity_row.get("institution_count"),
+                                    "cape_date_gap_days": gravity_row.get("cape_date_gap_days")}
+                                   if gravity_row else None),
+        "status": "INDICATOR_AND_FORWARD_RETURNS" if value is not None else "INDICATOR_VALUE_UNAVAILABLE",
+        "warning": "历史指标只使用所选年份末及之前可用的观测；机构源使用观测日期+30天作为保守可用日期；巴菲特季度数据按观测日+75天作为保守可用日期。R实际只接受 real ERP + real forward g、9–11 年期限，且与客观 CAPE 日期相差不超过 45 天。指数后续表现是实际市场回报，不等于策略收益；Theta 只有在匹配的机构 ERP/g 历史信号可识别时才计算。",
+        "sources": data.get("sources", []),
+    }
+
+
+def _latest_real_yield_known(rows: list[dict[str, Any]], as_of: str) -> float | None:
+    eligible = [r for r in rows if r.get("date", "") <= as_of and r.get("value") is not None]
+    return eligible[-1]["value"] if eligible else None
+
+
+def _growth_at_date(cape_rows: list[dict[str, Any]], as_of: str) -> float | None:
+    eligible = [r for r in cape_rows if r.get("date", "") <= as_of and r.get("real_earnings_growth_10y_pct") is not None]
+    return eligible[-1]["real_earnings_growth_10y_pct"] if eligible else None
+
+
+
+def charter_theory_history(force: bool = False, limit: int = 320) -> dict[str, Any]:
+    """Long-run macro analogues for the user's chartered-tax-company identities.
+
+    Uses FRED quarterly observations. The identities are tested as a mapping:
+    Q/V = M2/P and 1/P = Q/(M2*V), with P expressed as the GDP-deflator
+    multiplier (GDPDEF/100). V is derived as nominal GDP / M2. This is a
+    macroeconomic proxy series, not observed total listed-share count or a
+    stock-index price series; revised history is not point-in-time vintage data.
+    """
+    limit = max(40, min(600, int(limit)))
+    ids = {"M2": "M2SL", "GDP": "GDP", "P": "GDPDEF", "Q": "GDPC1"}
+    fetched: dict[str, list[dict[str, Any]]] = {}
+    errors: list[str] = []
+    for key, series_id in ids.items():
+        try:
+            fetched[key] = _series_csv(series_id, force=force)
+        except Exception as exc:
+            errors.append(f"{series_id}: {str(exc)[:120]}")
+            fetched[key] = []
+    if any(not fetched[k] for k in ids):
+        return {"ok": False, "status": "SOURCE_INCOMPLETE", "message": "长期趋势数据源不完整；不会用缺失值补齐。", "errors": errors, "series": {}}
+
+    def latest_at(rows: list[dict[str, Any]], d: str) -> dict[str, Any] | None:
+        eligible = [r for r in rows if r.get("date", "") <= d and _finite(r.get("value")) is not None]
+        return eligible[-1] if eligible else None
+
+    output = []
+    for qrow in fetched["Q"]:
+        d = qrow["date"]
+        m2row, gdprow, prow = latest_at(fetched["M2"], d), latest_at(fetched["GDP"], d), latest_at(fetched["P"], d)
+        q, m2, gdp, p_index = (_finite(qrow.get("value")), _finite(m2row.get("value")) if m2row else None,
+                               _finite(gdprow.get("value")) if gdprow else None, _finite(prow.get("value")) if prow else None)
+        if None in (q, m2, gdp, p_index) or min(q, m2, gdp, p_index) <= 0:
+            continue
+        p = p_index / 100.0
+        v = gdp / m2
+        # Both identities are independently calculated, not forced equal.
+        q_over_v = q / v
+        m2_over_p = m2 / p
+        inv_p = 1.0 / p
+        q_over_mv = q / (m2 * v)
+        output.append({"date": d, "Q": q, "M2": m2, "GDP_nominal": gdp,
+                       "P_deflator_index": p_index, "P_multiplier": p, "V": v,
+                       "Q_over_V_billions": q_over_v, "M2_over_P_billions": m2_over_p,
+                       "identity_gap_pct": ((q_over_v / m2_over_p) - 1.0) * 100.0,
+                       "one_over_P": inv_p, "Q_over_MV": q_over_mv,
+                       "price_identity_gap_pct": ((inv_p / q_over_mv) - 1.0) * 100.0,
+                       "source_dates": {"Q": d, "M2": m2row["date"], "GDP": gdprow["date"], "P": prow["date"]}})
+    if len(output) < 40:
+        return {"ok": False, "status": "INSUFFICIENT_HISTORY", "message": "共同口径历史不足40个季度。", "errors": errors, "series": {}}
+    # Keep quarterly history and a concise set of display metadata.
+    output = output[-limit:]
+    latest = output[-1]
+    return {"ok": True, "status": "READY", "as_of": latest["date"], "count": len(output),
+            "start_date": output[0]["date"], "end_date": latest["date"], "series": output,
+            "metrics": latest,
+            "summary": {"mean_identity_gap_pct": statistics.mean(r["identity_gap_pct"] for r in output),
+                        "max_abs_identity_gap_pct": max(abs(r["identity_gap_pct"]) for r in output),
+                        "mean_price_identity_gap_pct": statistics.mean(r["price_identity_gap_pct"] for r in output),
+                        "max_abs_price_identity_gap_pct": max(abs(r["price_identity_gap_pct"]) for r in output)},
+            "sources": [{"name": "FRED M2SL", "url": "https://fred.stlouisfed.org/series/M2SL", "available": bool(fetched["M2"]), "last_observation": fetched["M2"][-1]["date"]},
+                        {"name": "FRED GDP（名义GDP）", "url": "https://fred.stlouisfed.org/series/GDP", "available": bool(fetched["GDP"]), "last_observation": fetched["GDP"][-1]["date"]},
+                        {"name": "FRED GDPDEF（GDP平减指数）", "url": "https://fred.stlouisfed.org/series/GDPDEF", "available": bool(fetched["P"]), "last_observation": fetched["P"][-1]["date"]},
+                        {"name": "FRED GDPC1（实际GDP）", "url": "https://fred.stlouisfed.org/series/GDPC1", "available": bool(fetched["Q"]), "last_observation": fetched["Q"][-1]["date"]}],
+            "warning": "这是把宏观数据映射到你的费雪公式股票字典后的长期趋势代理，不是直接观测到的美股总股数/单股价格。FRED历史值可能被修订，不是严格实时点时序列。V=名义GDP/M2；P=GDPDEF/100。由于V由名义GDP/M2构造，且名义GDP与Q、P之间存在国民核算关系，两组等式偏差主要是代数/数据口径审计，不构成独立预测检验。"}
+
+def automatic_history(index: str = "SP500", limit: int = 240, force: bool = False) -> dict[str, Any]:
+    dashboard = automatic_dashboard(index, force)
+    if not dashboard.get("ok"):
+        return dashboard
+    series = dashboard.get("series") or {}
+    b = series.get("buffett") or []
+    c = series.get("cape") or []
+    r_obj = series.get("R_objective") or []
+    r_actual = series.get("R_actual") or []
+    theta = series.get("theta") or []
+    limit = max(12, min(600, int(limit)))
+    return {"ok": True, "index": index, "count_buffett": len(b), "count_cape": len(c),
+            "count_R_objective": len(r_obj), "count_R_actual": len(r_actual), "count_theta": len(theta),
+            "buffett": b[-limit:], "cape": c[-limit:], "R_objective": r_obj[-limit:],
+            "R_actual": r_actual[-limit:], "theta": theta[-limit:], "current": dashboard.get("metrics"),
+            "sources": dashboard.get("sources", []), "warning": dashboard.get("data_semantics", {})}
